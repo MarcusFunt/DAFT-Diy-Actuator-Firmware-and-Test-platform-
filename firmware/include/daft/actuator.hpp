@@ -1,0 +1,63 @@
+#pragma once
+
+#include <stdint.h>
+
+#include "daft/config.hpp"
+#include "daft/faults.hpp"
+#include "daft/platform.hpp"
+#include "daft/protocol_v2.hpp"
+
+namespace daft {
+
+struct ResponseWriter {
+  void* context = nullptr;
+  bool (*send)(void* context, const Packet& packet) = nullptr;
+};
+
+class Actuator {
+ public:
+  void begin(const ActuatorConfig& defaults, const MotionBackend& backend);
+  void update();
+  bool should_send_telemetry() const;
+  void mark_telemetry_sent();
+  void handle_packet(const Packet& request, const ResponseWriter& writer);
+
+  const ActuatorConfig& active_config() const { return active_config_; }
+  const ActuatorConfig& staged_config() const { return staged_config_; }
+  ActuatorState state() const { return state_; }
+  uint32_t faults() const { return faults_; }
+  const Counters& counters() const { return counters_; }
+
+ private:
+  void send_ack(const ResponseWriter& writer, uint16_t seq, MsgId acked_msg, ErrorCode code = ErrorCode::OK);
+  void send_error(const ResponseWriter& writer, uint16_t seq, MsgId rejected_msg, ErrorCode code);
+  void send_status(const ResponseWriter& writer, uint16_t seq, bool telemetry);
+  void send_identity(const ResponseWriter& writer, uint16_t seq);
+  void send_capabilities(const ResponseWriter& writer, uint16_t seq);
+  void send_faults(const ResponseWriter& writer, uint16_t seq);
+  void send_counters(const ResponseWriter& writer, uint16_t seq);
+  void send_driver_status(const ResponseWriter& writer, uint16_t seq);
+  void send_config_value(const ResponseWriter& writer, uint16_t seq, ConfigField field);
+  ErrorCode stage_field(const Packet& request);
+  ErrorCode apply_staged_config();
+  ErrorCode validate_motion_allowed(ControlMode requested_mode) const;
+  bool is_motion_state() const;
+  uint32_t now_ms() const;
+  void set_fault(FaultFlag flag);
+
+  MotionBackend backend_{};
+  ActuatorConfig defaults_{};
+  ActuatorConfig active_config_{};
+  ActuatorConfig staged_config_{};
+  ActuatorState state_ = ActuatorState::BOOTING;
+  ControlMode control_mode_ = ControlMode::DISABLED;
+  uint32_t faults_ = 0;
+  Counters counters_{};
+  uint32_t config_generation_ = 0;
+  bool driver_enabled_ = false;
+  bool config_staged_ = false;
+  uint32_t last_host_ms_ = 0;
+  uint32_t last_telemetry_ms_ = 0;
+};
+
+}  // namespace daft
