@@ -20,6 +20,8 @@ class Actuator {
   void update();
   bool should_send_telemetry() const;
   void mark_telemetry_sent();
+  void send_telemetry(const ResponseWriter& writer, uint16_t seq);
+  void record_frame_error(ErrorCode error);
   void handle_packet(const Packet& request, const ResponseWriter& writer);
 
   const ActuatorConfig& active_config() const { return active_config_; }

@@ -1,41 +1,50 @@
-# DAFT ESP32-C6 TMC2209 Stepper Controller
+# DAFT V1 Actuator Firmware
 
-This repo contains a small test platform for controlling one NEMA17 stepper motor through an ESP32-C6 and a TMC2209 driver.
+DAFT is now structured as reusable actuator firmware instead of an Arduino IDE sketch. V1 targets one locally planned TMC2209 stepper axis on ESP32-C6. Hosts send mode, target, configuration, and commissioning commands over DAFT Motion Binary v2; the actuator owns pulse timing, driver state, safety limits, persistence, telemetry, and faults.
 
-- `arduino/ESP32C6_TMC2209_Controller/ESP32C6_TMC2209_Controller.ino`
-- `python/stepper_control_ui.py`
-- `python/stepper_control_dpg.py`
-- `python/daft_protocol.py`
+Out of V1: multi-axis, encoders, homing, CAN/CAN-FD, STM32 HAL backend, ROS2, trajectory queues, closed-loop control, and firmware updates.
 
-## Arduino IDE Setup
+## Layout
 
-Install these Arduino libraries:
+```text
+firmware/
+  include/daft/              Platform-neutral C++ API and protocol types
+  src/                       Protocol codec, config validation, state machine
+  platforms/esp32_arduino/   PlatformIO ESP32-C6 backend
+  tests/                     Host-side C++ tests
+  platformio.ini             PlatformIO firmware build
+  CMakeLists.txt             Host test build
 
-- `FastAccelStepper`
-- `TMCStepper`
+python/
+  daft_protocol/             Binary v2 codec, serial transport, client, config metadata
+  apps/cli.py                CLI smoke and commissioning tool
+  apps/dpg_commissioning_gui.py
+  tests/                     Python protocol tests
+```
 
-Select your ESP32-C6 board, open the `.ino` file, and upload it.
+## Firmware Build
 
-Enable `USB CDC On Boot` for the selected ESP32-C6 board. Without this option, uploads over COM5 can still work, but the running sketch's `Serial` object will not use the native USB CDC port.
-
-With Arduino CLI, the generic ESP32-C6 build/upload target is:
+Install PlatformIO, then build the ESP32-C6 firmware:
 
 ```powershell
-arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc arduino\ESP32C6_TMC2209_Controller
-arduino-cli upload -p COM5 --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc arduino\ESP32C6_TMC2209_Controller
+pio run -d firmware -e esp32c6
 ```
 
-The sketch uses these pins:
+Upload:
+
+```powershell
+pio run -d firmware -e esp32c6 -t upload --upload-port COM5
+```
+
+The ESP32-C6 environment uses the Arduino framework through PlatformIO because the current hardware backend depends on FastAccelStepper and TMCStepper. The project is no longer an Arduino IDE sketch; the old `arduino/` sketch entrypoint has been removed.
+
+Current pins are defined in `firmware/include/daft/config.hpp`:
 
 ```cpp
-#define PIN_STEP            20
-#define PIN_DIR             19
-#define PIN_ENABLE          18
-#define PIN_TMC_UART_RX     17
-#define PIN_TMC_UART_TX     16
+step=20, dir=19, enable=18, tmc_uart_rx=17, tmc_uart_tx=16
 ```
 
-`PIN_ENABLE` is active low. The TMC2209 UART wiring is:
+`enable` is active low. TMC2209 UART wiring remains:
 
 ```text
 ESP32-C6 GPIO16 TX -> 1 kOhm -> TMC2209 PDN_UART
@@ -43,89 +52,75 @@ ESP32-C6 GPIO17 RX -----------> TMC2209 PDN_UART
 GND --------------------------> TMC2209 GND
 ```
 
-Set the motor current conservatively first. The default is `800 mA RMS`.
+Note: this machine’s stock PlatformIO `espressif32@6.10.0` package does not support Arduino on ESP32-C6. `firmware/platformio.ini` pins the ESP32-C6 environment to `pioarduino/platform-espressif32`, which supports Arduino core 3.x for ESP32-C6.
 
-## Python UIs
+## Host Tests
 
-Create a virtual environment if you want one, then install the Python dependencies:
-
-```powershell
-pip install -r python/requirements.txt
-```
-
-Run the newer DearPyGUI console:
+C++ core tests:
 
 ```powershell
-python python/stepper_control_dpg.py
+cmake -G "MinGW Makefiles" -S firmware -B firmware\build-mingw
+cmake --build firmware\build-mingw
+ctest --test-dir firmware\build-mingw --output-on-failure
 ```
 
-The original Tkinter UI is still available:
+Python protocol tests:
 
 ```powershell
-python python/stepper_control_ui.py
+$env:PYTHONPATH='python'
+python -m pytest -q python\tests
 ```
 
-Both UIs talk to the ESP32 over DAFT Motion Binary v1. The old newline text command protocol has been removed from the GUI path.
+## Python Tools
 
-Before sending motion commands, enable the driver with the UI checkbox. Motion commands are rejected while the driver is disabled.
+Install dependencies:
 
-Positions, speeds, and accelerations are integer step-pulse units. If you set `16` microsteps, one 200-step/rev NEMA17 revolution is `3200` position units.
+```powershell
+python -m pip install -r python\requirements.txt
+```
 
-## DAFT Motion Binary v1
+Run the CLI:
 
-The production command channel is a compact binary protocol:
+```powershell
+$env:PYTHONPATH='python'
+python python\apps\cli.py scan
+python python\apps\cli.py ping COM5
+python python\apps\cli.py identity COM5
+python python\apps\cli.py status COM5
+python python\apps\cli.py mode COM5 position
+python python\apps\cli.py move-rel COM5 --steps 1000 --speed 2000 --accel 5000
+python python\apps\cli.py stop COM5
+python python\apps\cli.py config get COM5 --field all
+python python\apps\cli.py config stage COM5 run_current_ma 700
+python python\apps\cli.py config apply COM5
+python python\apps\cli.py config save COM5
+```
 
-| Layer | Choice |
+Run the DearPyGUI commissioning app:
+
+```powershell
+$env:PYTHONPATH='python'
+python python\apps\dpg_commissioning_gui.py
+```
+
+## DAFT Motion Binary v2
+
+Raw packet before COBS:
+
+| Field | Type |
 | --- | --- |
-| Physical transport | USB CDC serial |
-| Framing | COBS, terminated by `0x00` |
-| Raw packet size | 32 bytes before COBS |
-| Endianness | Little-endian |
-| Numbers | Integers only |
-| Integrity | CRC-16/CCITT-FALSE over bytes `0..29` |
-| Timing ownership | ESP32 owns step timing |
+| version | `u8`, currently `2` |
+| msg_id | `u8` |
+| flags | `u8` |
+| seq | `u16` little-endian |
+| payload_len | `u16` little-endian |
+| payload | `0..128` bytes |
+| crc16 | CRC-16/CCITT-FALSE over header + payload |
 
-Raw packet layout before COBS:
+The raw packet is COBS encoded and terminated by `0x00`.
 
-| Offset | Field | Type |
-| --- | --- | --- |
-| 0 | version | `u8`, currently `1` |
-| 1 | msg_id | `u8` |
-| 2 | flags | `u8` |
-| 3 | payload_len | `u8`, max `23` |
-| 4-5 | seq | `u16` |
-| 6-28 | payload | 23 bytes |
-| 29 | reserved | `u8`, zero |
-| 30-31 | crc16 | `u16` |
+Core messages include `PING/PONG`, `GET_IDENTITY`, `GET_CAPABILITIES`, `GET_STATUS`, `GET_FAULTS`, `GET_COUNTERS`, `HEARTBEAT`, `SET_CONTROL_MODE`, `ESTOP`, `RAMP_STOP`, `CLEAR_FAULTS`, config query/stage/apply/save/reset, `GET_DRIVER_STATUS`, `MOVE_ABS`, `MOVE_REL`, `RUN_VEL`, and `SET_TELEM_RATE`.
 
-Host-to-ESP32 command IDs:
+Actuator states are explicit: `BOOTING`, `DISABLED`, `IDLE`, `MOVING_POSITION`, `RUNNING_VELOCITY`, `STOPPING`, `FAULTED`, `CONFIG_STAGED`, and `COMMISSIONING`.
 
-| ID | Name |
-| --- | --- |
-| `0x01` | `PING` |
-| `0x02` | `GET_STATUS` |
-| `0x03` | `SET_TELEM_RATE` |
-| `0x10` | `ENABLE` |
-| `0x11` | `DISABLE` |
-| `0x12` | `ESTOP` |
-| `0x13` | `STOP_RAMP` |
-| `0x14` | `ZERO_POSITION` |
-| `0x20` | `MOVE_ABS` |
-| `0x21` | `MOVE_REL` |
-| `0x22` | `RUN_VEL` |
-| `0x23` | `SET_SOFT_LIMITS` |
-| `0x30` | `DRIVER_CONFIG` |
-| `0x40` | `CLEAR_FAULTS` |
-
-ESP32-to-host packet IDs:
-
-| ID | Name |
-| --- | --- |
-| `0x80` | `ACK` |
-| `0x81` | `NACK` |
-| `0x82` | `STATUS` |
-| `0x83` | `EVENT` |
-
-The ESP32 replies to valid command packets with `ACK(seq)` or `NACK(seq, reason)`. Corrupt COBS/CRC frames are dropped without reply because the sequence number cannot be trusted.
-
-Default telemetry is off after boot. The GUI enables sparse `STATUS` telemetry while connected, and the firmware drops non-critical telemetry if the USB transmit path is busy. Text logging is intentionally disabled on the command port.
+Configuration changes are staged first, then applied, then optionally saved. ESP32 persistence uses two NVS slots with config version, payload length, CRC, generation counter, and a valid marker written last.

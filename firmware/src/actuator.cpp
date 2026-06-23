@@ -129,6 +129,21 @@ void Actuator::mark_telemetry_sent() {
   last_telemetry_ms_ = now_ms();
 }
 
+void Actuator::send_telemetry(const ResponseWriter& writer, uint16_t seq) {
+  send_status(writer, seq, true);
+  mark_telemetry_sent();
+}
+
+void Actuator::record_frame_error(ErrorCode error) {
+  counters_.decode_errors++;
+  if (error == ErrorCode::ERR_BAD_CRC) {
+    counters_.crc_errors++;
+    set_fault(FaultFlag::BAD_CRC);
+  } else {
+    set_fault(FaultFlag::RX_FRAME);
+  }
+}
+
 void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer) {
   counters_.command_count++;
   last_host_ms_ = now_ms();
