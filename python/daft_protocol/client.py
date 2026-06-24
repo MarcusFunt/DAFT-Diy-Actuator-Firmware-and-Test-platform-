@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .codec import Packet
+from .codec import Packet, ProtocolError
 from .messages import (
     ControlMode,
     ErrorCode,
@@ -24,6 +24,9 @@ from .messages import (
     parse_identity,
     parse_status,
 )
+
+
+TELEMETRY_FLAG = 1 << 2
 
 
 class DeviceError(RuntimeError):
@@ -52,7 +55,7 @@ class DaftClient:
 
         while True:
             packet = self.transport.read_packet()
-            if packet.msg_id == int(MsgId.STATUS) and packet.seq != seq:
+            if packet.msg_id == int(MsgId.STATUS) and (packet.flags & TELEMETRY_FLAG):
                 self.telemetry.append(parse_status(packet))
                 continue
             if packet.seq != seq:
@@ -63,6 +66,7 @@ class DaftClient:
                 return packet
             if packet.msg_id == expected:
                 return packet
+            raise ProtocolError(f"unexpected response 0x{packet.msg_id:02X} for seq {seq}")
 
     def acked(self, msg: MsgId | int, payload: bytes = b"") -> dict[str, object]:
         packet = self.request(msg, payload, MsgId.ACK)
@@ -74,6 +78,9 @@ class DaftClient:
         saw_ack = False
         while True:
             packet = self.transport.read_packet()
+            if packet.msg_id == int(MsgId.STATUS) and (packet.flags & TELEMETRY_FLAG):
+                self.telemetry.append(parse_status(packet))
+                continue
             if packet.seq != seq:
                 if packet.msg_id == int(MsgId.STATUS):
                     self.telemetry.append(parse_status(packet))

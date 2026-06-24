@@ -23,6 +23,7 @@ class Worker:
         self.client: DaftClient | None = None
         self.thread: threading.Thread | None = None
         self.stop = threading.Event()
+        self.lock = threading.Lock()
 
     def connect(self, port: str) -> None:
         self.disconnect()
@@ -44,14 +45,15 @@ class Worker:
         self.client = None
 
     def call(self, name: str, *args):
-        if self.client is None:
-            self.events.put(("log", "not connected"))
-            return
-        try:
-            result = getattr(self.client, name)(*args)
-            self.events.put(("result", name, result))
-        except Exception as exc:
-            self.events.put(("log", f"{name}: {exc}"))
+        with self.lock:
+            if self.client is None:
+                self.events.put(("log", "not connected"))
+                return
+            try:
+                result = getattr(self.client, name)(*args)
+                self.events.put(("result", name, result))
+            except Exception as exc:
+                self.events.put(("log", f"{name}: {exc}"))
 
     def _poll(self):
         while not self.stop.is_set():

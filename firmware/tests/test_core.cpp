@@ -18,12 +18,16 @@ struct FakeBackend {
   int32_t position = 0;
   int32_t target = 0;
   int32_t speed = 0;
+  uint32_t move_abs_count = 0;
+  uint32_t move_rel_count = 0;
+  uint32_t run_vel_count = 0;
+  uint32_t stop_count = 0;
   uint32_t save_count = 0;
   ActuatorConfig saved{};
 };
 
 struct Capture {
-  Packet packets[8]{};
+  Packet packets[32]{};
   size_t count = 0;
 };
 
@@ -44,6 +48,7 @@ bool fake_move_abs(void* context, int32_t target, uint32_t, uint32_t) {
   FakeBackend* backend = static_cast<FakeBackend*>(context);
   backend->target = target;
   backend->moving = true;
+  backend->move_abs_count++;
   return true;
 }
 
@@ -51,6 +56,7 @@ bool fake_move_rel(void* context, int32_t delta, uint32_t, uint32_t) {
   FakeBackend* backend = static_cast<FakeBackend*>(context);
   backend->target = backend->position + delta;
   backend->moving = true;
+  backend->move_rel_count++;
   return true;
 }
 
@@ -58,6 +64,7 @@ bool fake_run_vel(void* context, int32_t velocity, uint32_t) {
   FakeBackend* backend = static_cast<FakeBackend*>(context);
   backend->speed = velocity;
   backend->moving = true;
+  backend->run_vel_count++;
   return true;
 }
 
@@ -65,6 +72,7 @@ bool fake_stop(void* context, uint32_t) {
   FakeBackend* backend = static_cast<FakeBackend*>(context);
   backend->speed = 0;
   backend->moving = false;
+  backend->stop_count++;
   return true;
 }
 
@@ -287,6 +295,160 @@ void test_velocity_timeout() {
   assert(actuator.state() == ActuatorState::STOPPING || actuator.state() == ActuatorState::IDLE);
 }
 
+void test_duplicate_replay_and_mismatch() {
+  FakeBackend fake{};
+  Actuator actuator;
+  actuator.begin(default_config(), make_backend(&fake));
+  Capture capture{};
+  ResponseWriter writer = make_writer(&capture);
+
+  Packet mode = request(MsgId::SET_CONTROL_MODE, 30);
+  mode.payload_len = 1;
+  mode.payload[0] = static_cast<uint8_t>(ControlMode::POSITION);
+  actuator.handle_packet(mode, writer);
+
+  Packet move = request(MsgId::MOVE_REL, 31);
+  move.payload_len = 12;
+  write_i32(move.payload, 100);
+  write_u32(move.payload + 4, 2000);
+  write_u32(move.payload + 8, 2000);
+  actuator.handle_packet(move, writer);
+  const size_t first_move_response = capture.count - 1;
+  assert(fake.move_rel_count == 1);
+
+  actuator.handle_packet(move, writer);
+  assert(fake.move_rel_count == 1);
+  assert(actuator.counters().duplicate_packets == 1);
+  assert(capture.packets[capture.count - 1].msg_id == capture.packets[first_move_response].msg_id);
+  assert(capture.packets[capture.count - 1].payload[0] == capture.packets[first_move_response].payload[0]);
+
+  Packet mismatch = move;
+  write_i32(mismatch.payload, 200);
+  actuator.handle_packet(mismatch, writer);
+  assert(fake.move_rel_count == 1);
+  assert(actuator.counters().duplicate_packets == 2);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ERROR));
+  assert(capture.packets[capture.count - 1].payload[1] ==
+         static_cast<uint8_t>(ErrorCode::ERR_DUPLICATE_MISMATCH));
+}
+
+void test_invalid_payloads_and_control_mode() {
+  FakeBackend fake{};
+  Actuator actuator;
+  actuator.begin(default_config(), make_backend(&fake));
+  Capture capture{};
+  ResponseWriter writer = make_writer(&capture);
+
+  Packet mode = request(MsgId::SET_CONTROL_MODE, 40);
+  mode.payload_len = 1;
+  mode.payload[0] = 99;
+  actuator.handle_packet(mode, writer);
+  assert(actuator.state() == ActuatorState::DISABLED);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ERROR));
+  assert(capture.packets[capture.count - 1].payload[1] == static_cast<uint8_t>(ErrorCode::ERR_OUT_OF_RANGE));
+
+  Packet counters = request(MsgId::GET_COUNTERS, 41);
+  counters.payload_len = 1;
+  counters.payload[0] = 0;
+  actuator.handle_packet(counters, writer);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ERROR));
+  assert(capture.packets[capture.count - 1].payload[1] == static_cast<uint8_t>(ErrorCode::ERR_BAD_PAYLOAD));
+
+  Packet stop = request(MsgId::RAMP_STOP, 42);
+  stop.payload_len = 4;
+  write_u32(stop.payload, 1500);
+  actuator.handle_packet(stop, writer);
+  assert(fake.stop_count == 0);
+  assert(actuator.state() == ActuatorState::DISABLED);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ACK));
+
+  actuator.record_frame_error(ErrorCode::ERR_BAD_PAYLOAD);
+  assert(has_fault(actuator.faults(), FaultFlag::BAD_PAYLOAD));
+}
+
+void test_failed_config_stage_preserves_existing_staged_values() {
+  FakeBackend fake{};
+  Actuator actuator;
+  actuator.begin(default_config(), make_backend(&fake));
+  Capture capture{};
+  ResponseWriter writer = make_writer(&capture);
+
+  Packet stage_telem = request(MsgId::CONFIG_STAGE_FIELD, 50);
+  stage_telem.payload_len = 6;
+  write_u16(stage_telem.payload, static_cast<uint16_t>(ConfigField::TELEMETRY_INTERVAL_MS));
+  write_i32(stage_telem.payload + 2, 50);
+  actuator.handle_packet(stage_telem, writer);
+  assert(actuator.staged_config().telemetry.interval_ms == 50);
+
+  Packet bad_stage = request(MsgId::CONFIG_STAGE_FIELD, 51);
+  bad_stage.payload_len = 6;
+  write_u16(bad_stage.payload, static_cast<uint16_t>(ConfigField::MICROSTEPS));
+  write_i32(bad_stage.payload + 2, 3);
+  actuator.handle_packet(bad_stage, writer);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ERROR));
+  assert(actuator.staged_config().telemetry.interval_ms == 50);
+  assert(actuator.active_config().telemetry.interval_ms == 0);
+}
+
+void test_motion_limits_and_direction_inversion() {
+  FakeBackend fake{};
+  ActuatorConfig config = default_config();
+  config.motion.max_velocity_sps = 100;
+  config.motion.max_accel_sps2 = 100;
+  config.calibration.direction_inverted = true;
+  Actuator actuator;
+  actuator.begin(config, make_backend(&fake));
+  Capture capture{};
+  ResponseWriter writer = make_writer(&capture);
+
+  Packet mode = request(MsgId::SET_CONTROL_MODE, 60);
+  mode.payload_len = 1;
+  mode.payload[0] = static_cast<uint8_t>(ControlMode::POSITION);
+  actuator.handle_packet(mode, writer);
+
+  Packet too_fast = request(MsgId::MOVE_REL, 61);
+  too_fast.payload_len = 12;
+  write_i32(too_fast.payload, 50);
+  write_u32(too_fast.payload + 4, 101);
+  write_u32(too_fast.payload + 8, 100);
+  actuator.handle_packet(too_fast, writer);
+  assert(fake.move_rel_count == 0);
+  assert(capture.packets[capture.count - 1].payload[1] == static_cast<uint8_t>(ErrorCode::ERR_OUT_OF_RANGE));
+
+  Packet move = too_fast;
+  move.seq = 62;
+  write_u32(move.payload + 4, 100);
+  actuator.handle_packet(move, writer);
+  assert(fake.move_rel_count == 1);
+  assert(fake.target == -50);
+
+  fake.position = -50;
+  fake.target = -50;
+  fake.moving = false;
+  actuator.update();
+
+  Packet velocity_mode = request(MsgId::SET_CONTROL_MODE, 63);
+  velocity_mode.payload_len = 1;
+  velocity_mode.payload[0] = static_cast<uint8_t>(ControlMode::VELOCITY);
+  actuator.handle_packet(velocity_mode, writer);
+
+  Packet run = request(MsgId::RUN_VEL, 64);
+  run.payload_len = 8;
+  write_i32(run.payload, 40);
+  write_u32(run.payload + 4, 100);
+  actuator.handle_packet(run, writer);
+  assert(fake.run_vel_count == 1);
+  assert(fake.speed == -40);
+
+  Packet status = request(MsgId::GET_STATUS, 65);
+  actuator.handle_packet(status, writer);
+  const Packet& response = capture.packets[capture.count - 1];
+  assert(response.msg_id == static_cast<uint8_t>(MsgId::STATUS));
+  assert(read_i32(response.payload + 8) == 50);
+  assert(read_i32(response.payload + 12) == 50);
+  assert(read_i32(response.payload + 16) == 40);
+}
+
 }  // namespace
 
 int main() {
@@ -295,6 +457,10 @@ int main() {
   test_config_validation_and_serialization();
   test_actuator_motion_and_busy_rejection();
   test_velocity_timeout();
+  test_duplicate_replay_and_mismatch();
+  test_invalid_payloads_and_control_mode();
+  test_failed_config_stage_preserves_existing_staged_values();
+  test_motion_limits_and_direction_inversion();
   printf("daft_core_tests passed\n");
   return 0;
 }

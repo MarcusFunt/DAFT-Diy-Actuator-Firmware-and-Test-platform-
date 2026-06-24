@@ -24,7 +24,7 @@ from .messages import (
     parse_identity,
     parse_status,
 )
-from .transport_serial import SerialTransport, list_serial_ports
+from .transport_serial import SerialTransport, SerialTransportStats, list_serial_ports
 
 __all__ = [
     "CONFIG_FIELDS",
@@ -37,6 +37,7 @@ __all__ = [
     "Packet",
     "ProtocolError",
     "SerialTransport",
+    "SerialTransportStats",
     "State",
     "build_config_query",
     "build_config_stage_field",

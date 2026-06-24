@@ -16,6 +16,16 @@ def list_serial_ports() -> list[str]:
     return [port.device for port in list_ports.comports()]
 
 
+@dataclass(frozen=True)
+class SerialTransportStats:
+    packets_read: int = 0
+    bytes_read: int = 0
+    protocol_errors: int = 0
+    rx_overflows: int = 0
+    timeouts: int = 0
+    last_protocol_error: str | None = None
+
+
 @dataclass
 class SerialTransport:
     port_name: str
@@ -28,6 +38,12 @@ class SerialTransport:
     def __post_init__(self) -> None:
         self._port: serial.Serial | None = None
         self._rx = bytearray()
+        self._packets_read = 0
+        self._bytes_read = 0
+        self._protocol_errors = 0
+        self._rx_overflows = 0
+        self._timeouts = 0
+        self._last_protocol_error: str | None = None
 
     def __enter__(self) -> "SerialTransport":
         self.open()
@@ -39,6 +55,17 @@ class SerialTransport:
     @property
     def is_open(self) -> bool:
         return self._port is not None and self._port.is_open
+
+    @property
+    def stats(self) -> SerialTransportStats:
+        return SerialTransportStats(
+            packets_read=self._packets_read,
+            bytes_read=self._bytes_read,
+            protocol_errors=self._protocol_errors,
+            rx_overflows=self._rx_overflows,
+            timeouts=self._timeouts,
+            last_protocol_error=self._last_protocol_error,
+        )
 
     def open(self) -> None:
         self.close()
@@ -72,6 +99,7 @@ class SerialTransport:
             except ValueError:
                 if len(self._rx) > 256:
                     self._rx.clear()
+                    self._rx_overflows += 1
                     raise ProtocolError("RX buffer overflow")
                 return None
 
@@ -79,7 +107,9 @@ class SerialTransport:
             del self._rx[: delimiter + 1]
             if not frame:
                 continue
-            return decode_packet(frame)
+            packet = decode_packet(frame)
+            self._packets_read += 1
+            return packet
 
     def read_packet(self, timeout: float | None = None) -> Packet:
         if self._port is None:
@@ -89,7 +119,9 @@ class SerialTransport:
         while time.monotonic() < deadline:
             try:
                 packet = self._read_buffered_packet()
-            except ProtocolError:
+            except ProtocolError as exc:
+                self._protocol_errors += 1
+                self._last_protocol_error = str(exc)
                 continue
             if packet is not None:
                 return packet
@@ -97,6 +129,8 @@ class SerialTransport:
             chunk = self._port.read(128)
             if not chunk:
                 continue
+            self._bytes_read += len(chunk)
             self._rx.extend(chunk)
 
+        self._timeouts += 1
         raise TimeoutError("timed out waiting for packet")

@@ -113,6 +113,14 @@ def _require_len(packet: Packet, length: int, name: str) -> None:
         raise ProtocolError(f"{name} payload must be {length} bytes")
 
 
+def _msg_name(value: int) -> str:
+    return MsgId(value).name if value in MsgId._value2member_map_ else f"0x{value:02X}"
+
+
+def _error_name(value: int) -> str:
+    return ErrorCode(value).name if value in ErrorCode._value2member_map_ else f"ERR_{value}"
+
+
 def build_set_control_mode(mode: ControlMode | int) -> bytes:
     return struct.pack("<B", int(mode))
 
@@ -143,7 +151,7 @@ def build_config_stage_field(field: ConfigField | int, value: int) -> bytes:
 
 def parse_ack(packet: Packet) -> dict[str, object]:
     _require_len(packet, 2, "ACK")
-    return {"acked_msg": MsgId(packet.payload[0]).name, "code": ErrorCode(packet.payload[1]).name}
+    return {"acked_msg": _msg_name(packet.payload[0]), "code": _error_name(packet.payload[1])}
 
 
 def parse_error(packet: Packet) -> dict[str, object]:
@@ -151,8 +159,8 @@ def parse_error(packet: Packet) -> dict[str, object]:
     msg_id = packet.payload[0]
     code = packet.payload[1]
     return {
-        "rejected_msg": MsgId(msg_id).name if msg_id in MsgId._value2member_map_ else f"0x{msg_id:02X}",
-        "code": ErrorCode(code).name if code in ErrorCode._value2member_map_ else f"ERR_{code}",
+        "rejected_msg": _msg_name(msg_id),
+        "code": _error_name(code),
     }
 
 

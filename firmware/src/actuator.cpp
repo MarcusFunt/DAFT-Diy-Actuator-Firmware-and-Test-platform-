@@ -26,6 +26,21 @@ bool send_packet(const ResponseWriter& writer, const Packet& packet) {
   return writer.send != nullptr && writer.send(writer.context, packet);
 }
 
+struct CachedWriterContext {
+  ResponseWriter downstream;
+  Packet* responses = nullptr;
+  uint8_t capacity = 0;
+  uint8_t count = 0;
+};
+
+bool cached_send(void* context, const Packet& packet) {
+  CachedWriterContext* cached = static_cast<CachedWriterContext*>(context);
+  if (cached->responses != nullptr && cached->count < cached->capacity) {
+    cached->responses[cached->count++] = packet;
+  }
+  return send_packet(cached->downstream, packet);
+}
+
 bool payload_empty(const Packet& packet) {
   return packet.payload_len == 0;
 }
@@ -59,6 +74,10 @@ void Actuator::begin(const ActuatorConfig& defaults, const MotionBackend& backen
   config_staged_ = false;
   last_host_ms_ = now_ms();
   last_telemetry_ms_ = now_ms();
+  last_request_valid_ = false;
+  last_request_ = Packet{};
+  last_responses_[0] = Packet{};
+  last_response_count_ = 0;
 
   ActuatorConfig loaded{};
   uint32_t generation = 0;
@@ -139,15 +158,40 @@ void Actuator::record_frame_error(ErrorCode error) {
   if (error == ErrorCode::ERR_BAD_CRC) {
     counters_.crc_errors++;
     set_fault(FaultFlag::BAD_CRC);
+  } else if (error == ErrorCode::ERR_BAD_PAYLOAD) {
+    set_fault(FaultFlag::BAD_PAYLOAD);
   } else {
     set_fault(FaultFlag::RX_FRAME);
   }
 }
 
-void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer) {
+void Actuator::handle_packet(const Packet& request, const ResponseWriter& downstream_writer) {
+  if (last_request_valid_ && request.seq == last_request_.seq && request.msg_id == last_request_.msg_id) {
+    last_host_ms_ = now_ms();
+    counters_.duplicate_packets++;
+    if (same_request(request)) {
+      replay_last_response(downstream_writer);
+    } else {
+      send_error(downstream_writer, request.seq, static_cast<MsgId>(request.msg_id),
+                 ErrorCode::ERR_DUPLICATE_MISMATCH);
+    }
+    return;
+  }
+
+  Packet cached_responses[4]{};
+  CachedWriterContext cached_context{};
+  cached_context.downstream = downstream_writer;
+  cached_context.responses = cached_responses;
+  cached_context.capacity = static_cast<uint8_t>(sizeof(cached_responses) / sizeof(cached_responses[0]));
+
+  ResponseWriter writer{};
+  writer.context = &cached_context;
+  writer.send = cached_send;
+
   counters_.command_count++;
   last_host_ms_ = now_ms();
 
+  auto dispatch = [&]() {
   const MsgId msg = static_cast<MsgId>(request.msg_id);
   switch (msg) {
     case MsgId::PING:
@@ -161,7 +205,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
         response.msg_id = msg_u8(MsgId::PONG);
         response.flags = static_cast<uint8_t>(PacketFlag::RESPONSE);
         response.seq = request.seq;
-        send_packet(writer, response);
+        send_response(writer, response);
       }
       return;
 
@@ -190,20 +234,36 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       return;
 
     case MsgId::GET_FAULTS:
+      if (!payload_empty(request)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
       send_faults(writer, request.seq);
       return;
 
     case MsgId::GET_COUNTERS:
+      if (!payload_empty(request)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
       send_counters(writer, request.seq);
       return;
 
     case MsgId::HEARTBEAT:
+      if (!payload_empty(request)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
       send_ack(writer, request.seq, msg);
       return;
 
     case MsgId::SET_CONTROL_MODE:
       if (request.payload_len != 1) {
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
+      if (request.payload[0] > mode_u8(ControlMode::COMMISSIONING)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
       if (state_ == ActuatorState::FAULTED && request.payload[0] != mode_u8(ControlMode::DISABLED)) {
@@ -261,6 +321,11 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
     case MsgId::RAMP_STOP:
       if (request.payload_len != 4) {
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
+      if (!is_motion_state() &&
+          (backend_.motion_active == nullptr || !backend_.motion_active(backend_.context))) {
+        send_ack(writer, request.seq, msg);
         return;
       }
       if (backend_.ramp_stop == nullptr || !backend_.ramp_stop(backend_.context, read_u32(request.payload))) {
@@ -348,16 +413,25 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       active_config_ = defaults_;
       staged_config_ = defaults_;
       config_staged_ = false;
-      if (backend_.configure_driver != nullptr) {
-        backend_.configure_driver(backend_.context, active_config_.driver);
+      if (backend_.configure_driver != nullptr &&
+          !backend_.configure_driver(backend_.context, active_config_.driver)) {
+        set_fault(FaultFlag::DRIVER);
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
+        return;
       }
-      if (backend_.reset_config_storage != nullptr) {
-        backend_.reset_config_storage(backend_.context);
+      if (backend_.reset_config_storage != nullptr && !backend_.reset_config_storage(backend_.context)) {
+        set_fault(FaultFlag::CONFIG_STORAGE);
+        send_error(writer, request.seq, msg, ErrorCode::ERR_STORAGE);
+        return;
       }
       send_ack(writer, request.seq, msg);
       return;
 
     case MsgId::REBOOT:
+      if (!payload_empty(request)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
       send_ack(writer, request.seq, msg);
       if (backend_.reboot != nullptr) {
         backend_.reboot(backend_.context);
@@ -365,6 +439,10 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       return;
 
     case MsgId::GET_DRIVER_STATUS:
+      if (!payload_empty(request)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
+        return;
+      }
       send_driver_status(writer, request.seq);
       return;
 
@@ -382,7 +460,9 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       const uint32_t velocity = read_u32(request.payload + 4);
       const uint32_t accel = read_u32(request.payload + 8);
       if (velocity == 0 || accel == 0 || velocity > active_config_.safety.max_allowed_velocity_sps ||
-          accel > active_config_.safety.max_allowed_accel_sps2) {
+          accel > active_config_.safety.max_allowed_accel_sps2 ||
+          velocity > active_config_.motion.max_velocity_sps ||
+          accel > active_config_.motion.max_accel_sps2) {
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
@@ -391,7 +471,13 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
-      if (backend_.move_absolute == nullptr || !backend_.move_absolute(backend_.context, target, velocity, accel)) {
+      int32_t backend_target = 0;
+      if (!to_backend_value(target, &backend_target)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
+        return;
+      }
+      if (backend_.move_absolute == nullptr ||
+          !backend_.move_absolute(backend_.context, backend_target, velocity, accel)) {
         set_fault(FaultFlag::DRIVER);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
@@ -415,11 +501,13 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       const int32_t delta = read_i32(request.payload);
       const uint32_t velocity = read_u32(request.payload + 4);
       const uint32_t accel = read_u32(request.payload + 8);
-      const int32_t current = backend_.current_position != nullptr ? backend_.current_position(backend_.context) : 0;
+      const int32_t current = logical_current_position();
       const int64_t target64 = static_cast<int64_t>(current) + static_cast<int64_t>(delta);
       if (target64 < INT32_MIN || target64 > INT32_MAX || velocity == 0 || accel == 0 ||
           velocity > active_config_.safety.max_allowed_velocity_sps ||
-          accel > active_config_.safety.max_allowed_accel_sps2) {
+          accel > active_config_.safety.max_allowed_accel_sps2 ||
+          velocity > active_config_.motion.max_velocity_sps ||
+          accel > active_config_.motion.max_accel_sps2) {
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
@@ -428,7 +516,13 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
-      if (backend_.move_relative == nullptr || !backend_.move_relative(backend_.context, delta, velocity, accel)) {
+      int32_t backend_delta = 0;
+      if (!to_backend_value(delta, &backend_delta)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
+        return;
+      }
+      if (backend_.move_relative == nullptr ||
+          !backend_.move_relative(backend_.context, backend_delta, velocity, accel)) {
         set_fault(FaultFlag::DRIVER);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
@@ -454,11 +548,18 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
       const uint32_t abs_velocity = velocity < 0 ? static_cast<uint32_t>(-static_cast<int64_t>(velocity))
                                                  : static_cast<uint32_t>(velocity);
       if (velocity == 0 || accel == 0 || abs_velocity > active_config_.safety.max_allowed_velocity_sps ||
-          accel > active_config_.safety.max_allowed_accel_sps2) {
+          accel > active_config_.safety.max_allowed_accel_sps2 ||
+          abs_velocity > active_config_.motion.max_velocity_sps ||
+          accel > active_config_.motion.max_accel_sps2) {
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
-      if (backend_.run_velocity == nullptr || !backend_.run_velocity(backend_.context, velocity, accel)) {
+      int32_t backend_velocity = 0;
+      if (!to_backend_value(velocity, &backend_velocity)) {
+        send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
+        return;
+      }
+      if (backend_.run_velocity == nullptr || !backend_.run_velocity(backend_.context, backend_velocity, accel)) {
         set_fault(FaultFlag::DRIVER);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
@@ -474,18 +575,24 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& writer
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
         return;
       }
-      staged_config_ = active_config_;
-      staged_config_.telemetry.interval_ms = read_u16(request.payload);
-      active_config_.telemetry.interval_ms = staged_config_.telemetry.interval_ms;
+      active_config_.telemetry.interval_ms = read_u16(request.payload);
+      if (config_staged_) {
+        staged_config_.telemetry.interval_ms = active_config_.telemetry.interval_ms;
+      } else {
+        staged_config_ = active_config_;
+      }
       send_ack(writer, request.seq, msg);
       return;
 
     default:
-      counters_.rejected_commands++;
       set_fault(FaultFlag::UNSUPPORTED_COMMAND);
       send_error(writer, request.seq, msg, ErrorCode::ERR_UNSUPPORTED);
       return;
   }
+  };
+
+  dispatch();
+  remember_request(request, cached_responses, cached_context.count);
 }
 
 void Actuator::send_ack(const ResponseWriter& writer, uint16_t seq, MsgId acked_msg, ErrorCode code) {
@@ -496,7 +603,7 @@ void Actuator::send_ack(const ResponseWriter& writer, uint16_t seq, MsgId acked_
   response.payload_len = 2;
   response.payload[0] = msg_u8(acked_msg);
   response.payload[1] = code_u8(code);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_error(const ResponseWriter& writer, uint16_t seq, MsgId rejected_msg, ErrorCode code) {
@@ -508,7 +615,7 @@ void Actuator::send_error(const ResponseWriter& writer, uint16_t seq, MsgId reje
   response.payload_len = 2;
   response.payload[0] = msg_u8(rejected_msg);
   response.payload[1] = code_u8(code);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_status(const ResponseWriter& writer, uint16_t seq, bool telemetry) {
@@ -522,13 +629,13 @@ void Actuator::send_status(const ResponseWriter& writer, uint16_t seq, bool tele
   response.payload[2] = driver_enabled_ ? 1 : 0;
   response.payload[3] = config_staged_ ? 1 : 0;
   write_u32(response.payload + 4, faults_);
-  write_i32(response.payload + 8, backend_.current_position != nullptr ? backend_.current_position(backend_.context) : 0);
-  write_i32(response.payload + 12, backend_.target_position != nullptr ? backend_.target_position(backend_.context) : 0);
-  write_i32(response.payload + 16, backend_.current_speed != nullptr ? backend_.current_speed(backend_.context) : 0);
+  write_i32(response.payload + 8, logical_current_position());
+  write_i32(response.payload + 12, logical_target_position());
+  write_i32(response.payload + 16, logical_current_speed());
   write_u32(response.payload + 20, now_ms());
   write_u32(response.payload + 24, config_generation_);
   write_u32(response.payload + 28, counters_.command_count);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_identity(const ResponseWriter& writer, uint16_t seq) {
@@ -546,7 +653,7 @@ void Actuator::send_identity(const ResponseWriter& writer, uint16_t seq) {
   write_u16(response.payload + 6, CONFIG_VERSION);
   write_u32(response.payload + 8, 0x54464144u);  // DAFT
   write_u32(response.payload + 12, config_generation_);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_capabilities(const ResponseWriter& writer, uint16_t seq) {
@@ -563,7 +670,7 @@ void Actuator::send_capabilities(const ResponseWriter& writer, uint16_t seq) {
   write_u16(response.payload + 6, 100);  // practical max telemetry Hz
   write_u32(response.payload + 8, 0x00000001u);  // feature flags: serial binary v2
   write_u32(response.payload + 12, active_config_.safety.host_timeout_ms);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_faults(const ResponseWriter& writer, uint16_t seq) {
@@ -573,7 +680,7 @@ void Actuator::send_faults(const ResponseWriter& writer, uint16_t seq) {
   response.seq = seq;
   response.payload_len = 4;
   write_u32(response.payload, faults_);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_counters(const ResponseWriter& writer, uint16_t seq) {
@@ -589,7 +696,7 @@ void Actuator::send_counters(const ResponseWriter& writer, uint16_t seq) {
   write_u32(response.payload + 16, counters_.command_count);
   write_u32(response.payload + 20, counters_.rejected_commands);
   write_u32(response.payload + 24, now_ms());
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_driver_status(const ResponseWriter& writer, uint16_t seq) {
@@ -611,7 +718,7 @@ void Actuator::send_driver_status(const ResponseWriter& writer, uint16_t seq) {
   write_u16(response.payload + 6, status.microsteps);
   write_u32(response.payload + 8, status.raw_status);
   write_u32(response.payload + 12, 0);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 void Actuator::send_config_value(const ResponseWriter& writer, uint16_t seq, ConfigField field) {
@@ -630,7 +737,7 @@ void Actuator::send_config_value(const ResponseWriter& writer, uint16_t seq, Con
   response.payload[2] = static_cast<uint8_t>(config_field_mutability(field));
   response.payload[3] = config_staged_ ? 1 : 0;
   write_i32(response.payload + 4, value);
-  send_packet(writer, response);
+  send_response(writer, response);
 }
 
 ErrorCode Actuator::stage_field(const Packet& request) {
@@ -652,13 +759,13 @@ ErrorCode Actuator::stage_field(const Packet& request) {
     return ErrorCode::ERR_REQUIRES_REBOOT;
   }
 
-  staged_config_ = config_staged_ ? staged_config_ : active_config_;
-  const ConfigValidationResult validation = stage_config_field(staged_config_, field, value);
+  ActuatorConfig candidate = config_staged_ ? staged_config_ : active_config_;
+  const ConfigValidationResult validation = stage_config_field(candidate, field, value);
   if (!validation.ok) {
-    staged_config_ = active_config_;
     return ErrorCode::ERR_OUT_OF_RANGE;
   }
 
+  staged_config_ = candidate;
   config_staged_ = true;
   if (!is_motion_state()) {
     state_ = ActuatorState::CONFIG_STAGED;
@@ -727,6 +834,68 @@ bool Actuator::is_motion_state() const {
 
 uint32_t Actuator::now_ms() const {
   return backend_.millis != nullptr ? backend_.millis(backend_.context) : 0;
+}
+
+bool Actuator::send_response(const ResponseWriter& writer, const Packet& packet) {
+  if (!send_packet(writer, packet)) {
+    counters_.dropped_packets++;
+    return false;
+  }
+  return true;
+}
+
+bool Actuator::same_request(const Packet& request) const {
+  if (!last_request_valid_ || request.msg_id != last_request_.msg_id || request.flags != last_request_.flags ||
+      request.seq != last_request_.seq || request.payload_len != last_request_.payload_len) {
+    return false;
+  }
+  return request.payload_len == 0 || memcmp(request.payload, last_request_.payload, request.payload_len) == 0;
+}
+
+void Actuator::remember_request(const Packet& request, const Packet* responses, uint8_t response_count) {
+  last_request_ = request;
+  last_response_count_ = response_count > 4 ? 4 : response_count;
+  for (uint8_t i = 0; i < last_response_count_; ++i) {
+    last_responses_[i] = responses[i];
+  }
+  last_request_valid_ = true;
+}
+
+void Actuator::replay_last_response(const ResponseWriter& writer) {
+  for (uint8_t i = 0; i < last_response_count_; ++i) {
+    send_response(writer, last_responses_[i]);
+  }
+}
+
+bool Actuator::to_backend_value(int32_t logical, int32_t* backend_value) const {
+  if (!active_config_.calibration.direction_inverted) {
+    *backend_value = logical;
+    return true;
+  }
+  if (logical == INT32_MIN) {
+    return false;
+  }
+  *backend_value = -logical;
+  return true;
+}
+
+int32_t Actuator::from_backend_value(int32_t backend_value) const {
+  if (!active_config_.calibration.direction_inverted) {
+    return backend_value;
+  }
+  return backend_value == INT32_MIN ? INT32_MAX : -backend_value;
+}
+
+int32_t Actuator::logical_current_position() const {
+  return from_backend_value(backend_.current_position != nullptr ? backend_.current_position(backend_.context) : 0);
+}
+
+int32_t Actuator::logical_target_position() const {
+  return from_backend_value(backend_.target_position != nullptr ? backend_.target_position(backend_.context) : 0);
+}
+
+int32_t Actuator::logical_current_speed() const {
+  return from_backend_value(backend_.current_speed != nullptr ? backend_.current_speed(backend_.context) : 0);
 }
 
 void Actuator::set_fault(FaultFlag flag) {

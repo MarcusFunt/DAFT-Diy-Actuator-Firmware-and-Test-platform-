@@ -46,6 +46,15 @@ class Actuator {
   bool is_motion_state() const;
   uint32_t now_ms() const;
   void set_fault(FaultFlag flag);
+  bool send_response(const ResponseWriter& writer, const Packet& packet);
+  bool same_request(const Packet& request) const;
+  void remember_request(const Packet& request, const Packet* responses, uint8_t response_count);
+  void replay_last_response(const ResponseWriter& writer);
+  bool to_backend_value(int32_t logical, int32_t* backend_value) const;
+  int32_t from_backend_value(int32_t backend_value) const;
+  int32_t logical_current_position() const;
+  int32_t logical_target_position() const;
+  int32_t logical_current_speed() const;
 
   MotionBackend backend_{};
   ActuatorConfig defaults_{};
@@ -60,6 +69,10 @@ class Actuator {
   bool config_staged_ = false;
   uint32_t last_host_ms_ = 0;
   uint32_t last_telemetry_ms_ = 0;
+  bool last_request_valid_ = false;
+  Packet last_request_{};
+  Packet last_responses_[4]{};
+  uint8_t last_response_count_ = 0;
 };
 
 }  // namespace daft

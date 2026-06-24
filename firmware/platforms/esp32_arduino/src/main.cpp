@@ -132,7 +132,7 @@ bool save_config_slot(const ActuatorConfig& config) {
   const bool valid0 = read_slot(0, &ignored, &gen0);
   const bool valid1 = read_slot(1, &ignored, &gen1);
   const uint32_t next_generation = (valid0 || valid1 ? max(gen0, gen1) : 0) + 1;
-  const uint8_t target_slot = (!valid0 || (valid1 && gen1 < gen0)) ? 1 : 0;
+  const uint8_t target_slot = !valid0 ? 0 : (!valid1 ? 1 : (gen0 <= gen1 ? 0 : 1));
 
   const char* valid_key = nullptr;
   const char* meta_key = nullptr;
@@ -188,8 +188,8 @@ bool cb_configure_driver(void*, const Tmc2209Config& config) {
   driver.pwm_autoscale(true);
   driver.intpol(config.interpolation);
   driver.TCOOLTHRS(0xFFFFF);
-  driver_configured = true;
-  return true;
+  driver_configured = driver.test_connection() == 0;
+  return driver_configured;
 }
 
 bool cb_move_absolute(void*, int32_t target_steps, uint32_t max_velocity_sps, uint32_t accel_sps2) {

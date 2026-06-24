@@ -1,5 +1,0 @@
-C:/Users/marcu/Documents/DAFT (Diy Actuator Firmware and Test-platform)/firmware/build-mingw/CMakeFiles/daft_core.dir
-C:/Users/marcu/Documents/DAFT (Diy Actuator Firmware and Test-platform)/firmware/build-mingw/CMakeFiles/daft_core_tests.dir
-C:/Users/marcu/Documents/DAFT (Diy Actuator Firmware and Test-platform)/firmware/build-mingw/CMakeFiles/test.dir
-C:/Users/marcu/Documents/DAFT (Diy Actuator Firmware and Test-platform)/firmware/build-mingw/CMakeFiles/edit_cache.dir
-C:/Users/marcu/Documents/DAFT (Diy Actuator Firmware and Test-platform)/firmware/build-mingw/CMakeFiles/rebuild_cache.dir
