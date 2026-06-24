@@ -212,4 +212,18 @@ const char* state_name(ActuatorState state) {
   }
 }
 
+const char* event_name(EventType event) {
+  switch (event) {
+    case EventType::BOOT_REASON: return "BOOT_REASON";
+    case EventType::STATE_CHANGED: return "STATE_CHANGED";
+    case EventType::FAULT_SET: return "FAULT_SET";
+    case EventType::FAULT_CLEARED: return "FAULT_CLEARED";
+    case EventType::CONFIG_APPLIED: return "CONFIG_APPLIED";
+    case EventType::CONFIG_SAVED: return "CONFIG_SAVED";
+    case EventType::DRIVER_UART_FAILURE: return "DRIVER_UART_FAILURE";
+    case EventType::HOST_TIMEOUT: return "HOST_TIMEOUT";
+    default: return "EVENT_UNKNOWN";
+  }
+}
+
 }  // namespace daft

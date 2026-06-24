@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daft-tools"
+version = "0.1.0"
+description = "Host tools for DAFT actuator firmware"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+gui = [
+  "dearpygui>=2.0.0",
+]
+test = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+daft = "apps.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["apps*", "daft_protocol*"]

@@ -81,6 +81,23 @@ enum class ActuatorState : uint8_t {
   COMMISSIONING = 8,
 };
 
+enum class EventType : uint8_t {
+  BOOT_REASON = 1,
+  STATE_CHANGED = 2,
+  FAULT_SET = 3,
+  FAULT_CLEARED = 4,
+  CONFIG_APPLIED = 5,
+  CONFIG_SAVED = 6,
+  DRIVER_UART_FAILURE = 7,
+  HOST_TIMEOUT = 8,
+};
+
+enum class EventSeverity : uint8_t {
+  INFO = 0,
+  WARNING = 1,
+  ERROR = 2,
+};
+
 enum class ControlMode : uint8_t {
   DISABLED = 0,
   POSITION = 1,
@@ -138,5 +155,6 @@ class FramingDecoder {
 const char* msg_name(uint8_t msg_id);
 const char* error_name(ErrorCode error);
 const char* state_name(ActuatorState state);
+const char* event_name(EventType event);
 
 }  // namespace daft

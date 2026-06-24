@@ -12,6 +12,7 @@
 
 #include "daft/actuator.hpp"
 #include "daft/config.hpp"
+#include "daft/config_store.hpp"
 #include "daft/protocol_v2.hpp"
 
 using namespace daft;
@@ -19,8 +20,6 @@ using namespace daft;
 namespace {
 
 constexpr uint32_t USB_BAUD = 115200;
-constexpr uint32_t CONFIG_MAGIC = 0x44414654u;  // DAFT
-constexpr uint32_t SLOT_VALID_MARKER = 0xA5D0C0DEu;
 constexpr char NVS_NAMESPACE[] = "daft_cfg";
 
 HardwareSerial TmcSerial(1);
@@ -33,13 +32,6 @@ FramingDecoder decoder;
 uint16_t device_seq = 1;
 bool driver_configured = false;
 ActuatorConfig boot_config = default_config();
-
-struct SlotMeta {
-  uint16_t version = CONFIG_VERSION;
-  uint16_t length = 0;
-  uint32_t generation = 0;
-  uint16_t crc = 0;
-};
 
 struct Esp32Context {
   ActuatorConfig defaults;
@@ -64,27 +56,7 @@ void slot_keys(uint8_t slot, const char** valid_key, const char** meta_key, cons
   *payload_key = payload_keys[slot];
 }
 
-void write_meta(uint8_t* out, const SlotMeta& meta) {
-  write_u32(out, CONFIG_MAGIC);
-  write_u16(out + 4, meta.version);
-  write_u16(out + 6, meta.length);
-  write_u32(out + 8, meta.generation);
-  write_u16(out + 12, meta.crc);
-  write_u16(out + 14, 0);
-}
-
-bool read_meta(const uint8_t* in, SlotMeta* meta) {
-  if (read_u32(in) != CONFIG_MAGIC) {
-    return false;
-  }
-  meta->version = read_u16(in + 4);
-  meta->length = read_u16(in + 6);
-  meta->generation = read_u32(in + 8);
-  meta->crc = read_u16(in + 12);
-  return meta->version == CONFIG_VERSION && meta->length <= CONFIG_BLOB_MAX_SIZE;
-}
-
-bool read_slot(uint8_t slot, ActuatorConfig* config, uint32_t* generation) {
+bool esp32_read_slot(void*, uint8_t slot, ConfigStoreSlotRead* out) {
   const char* valid_key = nullptr;
   const char* meta_key = nullptr;
   const char* payload_key = nullptr;
@@ -95,56 +67,19 @@ bool read_slot(uint8_t slot, ActuatorConfig* config, uint32_t* generation) {
     return false;
   }
 
-  const bool valid = prefs.getUInt(valid_key, 0) == SLOT_VALID_MARKER;
-  if (!valid) {
-    prefs.end();
-    return false;
-  }
-
-  uint8_t meta_raw[16]{};
-  uint8_t payload[CONFIG_BLOB_MAX_SIZE]{};
-  const size_t meta_len = prefs.getBytes(meta_key, meta_raw, sizeof(meta_raw));
-  SlotMeta meta{};
-  bool ok = meta_len == sizeof(meta_raw) && read_meta(meta_raw, &meta);
-  if (ok) {
-    const size_t payload_len = prefs.getBytes(payload_key, payload, sizeof(payload));
-    ok = payload_len == meta.length && crc16_ccitt(payload, meta.length) == meta.crc &&
-         deserialize_config(payload, payload_len, config);
-  }
+  out->valid_marker = prefs.getUInt(valid_key, 0) == CONFIG_STORE_VALID_MARKER;
+  out->meta_len = prefs.getBytes(meta_key, out->meta, sizeof(out->meta));
+  out->payload_len = prefs.getBytes(payload_key, out->payload, sizeof(out->payload));
   prefs.end();
-
-  if (ok) {
-    *generation = meta.generation;
-  }
-  return ok;
+  return true;
 }
 
-bool save_config_slot(const ActuatorConfig& config) {
-  uint8_t payload[CONFIG_BLOB_MAX_SIZE]{};
-  size_t payload_len = 0;
-  if (!serialize_config(config, payload, sizeof(payload), &payload_len)) {
-    return false;
-  }
-
-  ActuatorConfig ignored{};
-  uint32_t gen0 = 0;
-  uint32_t gen1 = 0;
-  const bool valid0 = read_slot(0, &ignored, &gen0);
-  const bool valid1 = read_slot(1, &ignored, &gen1);
-  const uint32_t next_generation = (valid0 || valid1 ? max(gen0, gen1) : 0) + 1;
-  const uint8_t target_slot = !valid0 ? 0 : (!valid1 ? 1 : (gen0 <= gen1 ? 0 : 1));
-
+bool esp32_write_slot(void*, uint8_t slot, const uint8_t* meta, size_t meta_len,
+                      const uint8_t* payload, size_t payload_len) {
   const char* valid_key = nullptr;
   const char* meta_key = nullptr;
   const char* payload_key = nullptr;
-  slot_keys(target_slot, &valid_key, &meta_key, &payload_key);
-
-  SlotMeta meta{};
-  meta.length = static_cast<uint16_t>(payload_len);
-  meta.generation = next_generation;
-  meta.crc = crc16_ccitt(payload, payload_len);
-  uint8_t meta_raw[16]{};
-  write_meta(meta_raw, meta);
+  slot_keys(slot, &valid_key, &meta_key, &payload_key);
 
   Preferences prefs;
   if (!prefs.begin(NVS_NAMESPACE, false)) {
@@ -152,10 +87,28 @@ bool save_config_slot(const ActuatorConfig& config) {
   }
   prefs.putUInt(valid_key, 0);
   const bool ok = prefs.putBytes(payload_key, payload, payload_len) == payload_len &&
-                  prefs.putBytes(meta_key, meta_raw, sizeof(meta_raw)) == sizeof(meta_raw) &&
-                  prefs.putUInt(valid_key, SLOT_VALID_MARKER) == sizeof(uint32_t);
+                  prefs.putBytes(meta_key, meta, meta_len) == meta_len &&
+                  prefs.putUInt(valid_key, CONFIG_STORE_VALID_MARKER) == sizeof(uint32_t);
   prefs.end();
   return ok;
+}
+
+bool esp32_clear_config_store(void*) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  const bool ok = prefs.clear();
+  prefs.end();
+  return ok;
+}
+
+ConfigStoreIo config_store_io() {
+  ConfigStoreIo io{};
+  io.read_slot = esp32_read_slot;
+  io.write_slot = esp32_write_slot;
+  io.clear = esp32_clear_config_store;
+  return io;
 }
 
 uint32_t cb_millis(void*) {
@@ -270,43 +223,29 @@ DriverStatus cb_driver_status(void*) {
 }
 
 bool cb_save_config(void*, const ActuatorConfig& config) {
-  return save_config_slot(config);
+  uint32_t generation = 0;
+  return config_store_save(config_store_io(), config, &generation);
 }
 
 bool cb_load_config(void*, ActuatorConfig* config, uint32_t* generation) {
-  ActuatorConfig slot0{};
-  ActuatorConfig slot1{};
-  uint32_t gen0 = 0;
-  uint32_t gen1 = 0;
-  const bool valid0 = read_slot(0, &slot0, &gen0);
-  const bool valid1 = read_slot(1, &slot1, &gen1);
-  if (!valid0 && !valid1) {
+  if (!config_store_load(config_store_io(), config, generation)) {
     return false;
-  }
-  if (valid1 && (!valid0 || gen1 > gen0)) {
-    *config = slot1;
-    *generation = gen1;
-  } else {
-    *config = slot0;
-    *generation = gen0;
   }
   boot_config = *config;
   return true;
 }
 
 bool cb_reset_config_storage(void*) {
-  Preferences prefs;
-  if (!prefs.begin(NVS_NAMESPACE, false)) {
-    return false;
-  }
-  const bool ok = prefs.clear();
-  prefs.end();
-  return ok;
+  return config_store_clear(config_store_io());
 }
 
 void cb_reboot(void*) {
   delay(50);
   ESP.restart();
+}
+
+uint32_t cb_boot_reason(void*) {
+  return static_cast<uint32_t>(esp_reset_reason());
 }
 
 MotionBackend make_backend() {
@@ -329,6 +268,7 @@ MotionBackend make_backend() {
   backend.load_config = cb_load_config;
   backend.reset_config_storage = cb_reset_config_storage;
   backend.reboot = cb_reboot;
+  backend.boot_reason = cb_boot_reason;
   return backend;
 }
 
@@ -397,6 +337,7 @@ void setup() {
 
 void loop() {
   service_serial();
-  actuator.update();
+  ResponseWriter writer = serial_writer();
+  actuator.update(&writer);
   service_telemetry();
 }

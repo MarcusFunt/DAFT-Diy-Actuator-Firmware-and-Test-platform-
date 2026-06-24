@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "daft/build_info.hpp"
+
 namespace daft {
 
 namespace {
@@ -58,6 +60,27 @@ bool soft_limit_violation(const ActuatorConfig& config, int32_t target) {
          (target < config.motion.soft_min_steps || target > config.motion.soft_max_steps);
 }
 
+uint16_t fault_bit(FaultFlag flag) {
+  uint32_t value = fault_value(flag);
+  uint16_t bit = 0;
+  while (value > 1u) {
+    value >>= 1;
+    ++bit;
+  }
+  return bit;
+}
+
+void copy_ascii(uint8_t* dst, size_t dst_capacity, const char* src, uint8_t* written) {
+  size_t count = 0;
+  if (src != nullptr) {
+    while (src[count] != '\0' && count < dst_capacity) {
+      dst[count] = static_cast<uint8_t>(src[count]);
+      ++count;
+    }
+  }
+  *written = static_cast<uint8_t>(count);
+}
+
 }  // namespace
 
 void Actuator::begin(const ActuatorConfig& defaults, const MotionBackend& backend) {
@@ -72,6 +95,8 @@ void Actuator::begin(const ActuatorConfig& defaults, const MotionBackend& backen
   config_generation_ = 0;
   driver_enabled_ = false;
   config_staged_ = false;
+  boot_event_pending_ = true;
+  boot_reason_ = backend_.boot_reason != nullptr ? backend_.boot_reason(backend_.context) : 0;
   last_host_ms_ = now_ms();
   last_telemetry_ms_ = now_ms();
   last_request_valid_ = false;
@@ -94,28 +119,39 @@ void Actuator::begin(const ActuatorConfig& defaults, const MotionBackend& backen
 
   if (backend_.configure_driver != nullptr && !backend_.configure_driver(backend_.context, active_config_.driver)) {
     set_fault(FaultFlag::DRIVER);
-    state_ = ActuatorState::FAULTED;
+    transition_to(ActuatorState::FAULTED);
     return;
   }
 
   if (backend_.enable_driver != nullptr) {
     backend_.enable_driver(backend_.context, false);
   }
-  state_ = ActuatorState::DISABLED;
+  transition_to(ActuatorState::DISABLED);
 }
 
-void Actuator::update() {
+void Actuator::update(const ResponseWriter* event_writer) {
   const uint32_t now = now_ms();
+
+  if (boot_event_pending_ && event_writer != nullptr) {
+    send_event(*event_writer, 0, EventType::BOOT_REASON, EventSeverity::INFO,
+               static_cast<uint16_t>(boot_reason_ & 0xFFFFu), boot_reason_);
+    boot_event_pending_ = false;
+  }
 
   if ((state_ == ActuatorState::MOVING_POSITION || state_ == ActuatorState::STOPPING) &&
       backend_.motion_active != nullptr && !backend_.motion_active(backend_.context)) {
-    state_ = driver_enabled_ ? ActuatorState::IDLE : ActuatorState::DISABLED;
+    transition_to(driver_enabled_ ? ActuatorState::IDLE : ActuatorState::DISABLED, event_writer);
     control_mode_ = driver_enabled_ ? ControlMode::POSITION : ControlMode::DISABLED;
   }
 
   if (state_ == ActuatorState::RUNNING_VELOCITY && active_config_.safety.host_timeout_ms > 0 &&
       static_cast<uint32_t>(now - last_host_ms_) > active_config_.safety.host_timeout_ms) {
-    set_fault(FaultFlag::HOST_TIMEOUT);
+    set_fault(FaultFlag::HOST_TIMEOUT, event_writer);
+    if (event_writer != nullptr) {
+      send_event(*event_writer, 0, EventType::HOST_TIMEOUT, EventSeverity::ERROR,
+                 static_cast<uint16_t>(active_config_.safety.velocity_timeout_action),
+                 active_config_.safety.host_timeout_ms);
+    }
     if (active_config_.safety.velocity_timeout_action == TimeoutAction::DISABLE) {
       if (backend_.emergency_stop != nullptr) {
         backend_.emergency_stop(backend_.context);
@@ -125,12 +161,12 @@ void Actuator::update() {
       }
       driver_enabled_ = false;
       control_mode_ = ControlMode::DISABLED;
-      state_ = ActuatorState::FAULTED;
+      transition_to(ActuatorState::FAULTED, event_writer);
     } else {
       if (backend_.ramp_stop != nullptr) {
         backend_.ramp_stop(backend_.context, active_config_.motion.default_stop_decel_sps2);
       }
-      state_ = ActuatorState::STOPPING;
+      transition_to(ActuatorState::STOPPING, event_writer);
       control_mode_ = ControlMode::POSITION;
     }
   }
@@ -280,23 +316,23 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
           backend_.enable_driver(backend_.context, false);
         }
         driver_enabled_ = false;
-        state_ = ActuatorState::DISABLED;
+        transition_to(ActuatorState::DISABLED, &downstream_writer);
       } else if (control_mode_ == ControlMode::COMMISSIONING) {
         if (backend_.enable_driver != nullptr && !backend_.enable_driver(backend_.context, true)) {
-          set_fault(FaultFlag::DRIVER);
+          set_fault(FaultFlag::DRIVER, &downstream_writer);
           send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
           return;
         }
         driver_enabled_ = true;
-        state_ = ActuatorState::COMMISSIONING;
+        transition_to(ActuatorState::COMMISSIONING, &downstream_writer);
       } else {
         if (backend_.enable_driver != nullptr && !backend_.enable_driver(backend_.context, true)) {
-          set_fault(FaultFlag::DRIVER);
+          set_fault(FaultFlag::DRIVER, &downstream_writer);
           send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
           return;
         }
         driver_enabled_ = true;
-        state_ = ActuatorState::IDLE;
+        transition_to(ActuatorState::IDLE, &downstream_writer);
       }
       send_ack(writer, request.seq, msg);
       return;
@@ -314,7 +350,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
       }
       driver_enabled_ = false;
       control_mode_ = ControlMode::DISABLED;
-      state_ = ActuatorState::FAULTED;
+      transition_to(ActuatorState::FAULTED, &downstream_writer);
       send_ack(writer, request.seq, msg);
       return;
 
@@ -329,11 +365,11 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         return;
       }
       if (backend_.ramp_stop == nullptr || !backend_.ramp_stop(backend_.context, read_u32(request.payload))) {
-        set_fault(FaultFlag::DRIVER);
+        set_fault(FaultFlag::DRIVER, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
       }
-      state_ = ActuatorState::STOPPING;
+      transition_to(ActuatorState::STOPPING, &downstream_writer);
       control_mode_ = ControlMode::POSITION;
       send_ack(writer, request.seq, msg);
       return;
@@ -343,12 +379,19 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
         return;
       }
-      faults_ = 0;
+      {
+        const uint32_t previous_faults = faults_;
+        faults_ = 0;
+        if (previous_faults != 0) {
+          send_event(downstream_writer, request.seq, EventType::FAULT_CLEARED, EventSeverity::INFO, 0,
+                     previous_faults);
+        }
+      }
       if (!driver_enabled_) {
-        state_ = ActuatorState::DISABLED;
+        transition_to(ActuatorState::DISABLED, &downstream_writer);
         control_mode_ = ControlMode::DISABLED;
       } else {
-        state_ = ActuatorState::IDLE;
+        transition_to(ActuatorState::IDLE, &downstream_writer);
       }
       send_ack(writer, request.seq, msg);
       return;
@@ -364,7 +407,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
     }
 
     case MsgId::CONFIG_STAGE_FIELD: {
-      ErrorCode code = stage_field(request);
+      ErrorCode code = stage_field(request, &downstream_writer);
       if (code != ErrorCode::OK) {
         send_error(writer, request.seq, msg, code);
         return;
@@ -378,7 +421,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_PAYLOAD);
         return;
       }
-      ErrorCode code = apply_staged_config();
+      ErrorCode code = apply_staged_config(&downstream_writer);
       if (code != ErrorCode::OK) {
         send_error(writer, request.seq, msg, code);
         return;
@@ -393,11 +436,13 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         return;
       }
       if (backend_.save_config == nullptr || !backend_.save_config(backend_.context, active_config_)) {
-        set_fault(FaultFlag::CONFIG_STORAGE);
+        set_fault(FaultFlag::CONFIG_STORAGE, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_STORAGE);
         return;
       }
       ++config_generation_;
+      send_event(downstream_writer, request.seq, EventType::CONFIG_SAVED, EventSeverity::INFO, CONFIG_VERSION,
+                 config_generation_);
       send_ack(writer, request.seq, msg);
       return;
 
@@ -415,15 +460,17 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
       config_staged_ = false;
       if (backend_.configure_driver != nullptr &&
           !backend_.configure_driver(backend_.context, active_config_.driver)) {
-        set_fault(FaultFlag::DRIVER);
+        set_fault(FaultFlag::DRIVER, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
       }
       if (backend_.reset_config_storage != nullptr && !backend_.reset_config_storage(backend_.context)) {
-        set_fault(FaultFlag::CONFIG_STORAGE);
+        set_fault(FaultFlag::CONFIG_STORAGE, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_STORAGE);
         return;
       }
+      send_event(downstream_writer, request.seq, EventType::CONFIG_APPLIED, EventSeverity::INFO, CONFIG_VERSION,
+                 config_generation_);
       send_ack(writer, request.seq, msg);
       return;
 
@@ -467,7 +514,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         return;
       }
       if (soft_limit_violation(active_config_, target)) {
-        set_fault(FaultFlag::SOFT_LIMIT);
+        set_fault(FaultFlag::SOFT_LIMIT, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
@@ -478,11 +525,11 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
       }
       if (backend_.move_absolute == nullptr ||
           !backend_.move_absolute(backend_.context, backend_target, velocity, accel)) {
-        set_fault(FaultFlag::DRIVER);
+        set_fault(FaultFlag::DRIVER, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
       }
-      state_ = ActuatorState::MOVING_POSITION;
+      transition_to(ActuatorState::MOVING_POSITION, &downstream_writer);
       control_mode_ = ControlMode::POSITION;
       send_ack(writer, request.seq, msg);
       return;
@@ -512,7 +559,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         return;
       }
       if (soft_limit_violation(active_config_, static_cast<int32_t>(target64))) {
-        set_fault(FaultFlag::SOFT_LIMIT);
+        set_fault(FaultFlag::SOFT_LIMIT, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_OUT_OF_RANGE);
         return;
       }
@@ -523,11 +570,11 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
       }
       if (backend_.move_relative == nullptr ||
           !backend_.move_relative(backend_.context, backend_delta, velocity, accel)) {
-        set_fault(FaultFlag::DRIVER);
+        set_fault(FaultFlag::DRIVER, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
       }
-      state_ = ActuatorState::MOVING_POSITION;
+      transition_to(ActuatorState::MOVING_POSITION, &downstream_writer);
       control_mode_ = ControlMode::POSITION;
       send_ack(writer, request.seq, msg);
       return;
@@ -560,11 +607,11 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         return;
       }
       if (backend_.run_velocity == nullptr || !backend_.run_velocity(backend_.context, backend_velocity, accel)) {
-        set_fault(FaultFlag::DRIVER);
+        set_fault(FaultFlag::DRIVER, &downstream_writer);
         send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
         return;
       }
-      state_ = ActuatorState::RUNNING_VELOCITY;
+      transition_to(ActuatorState::RUNNING_VELOCITY, &downstream_writer);
       control_mode_ = ControlMode::VELOCITY;
       send_ack(writer, request.seq, msg);
       return;
@@ -585,7 +632,7 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
       return;
 
     default:
-      set_fault(FaultFlag::UNSUPPORTED_COMMAND);
+      set_fault(FaultFlag::UNSUPPORTED_COMMAND, &downstream_writer);
       send_error(writer, request.seq, msg, ErrorCode::ERR_UNSUPPORTED);
       return;
   }
@@ -643,16 +690,20 @@ void Actuator::send_identity(const ResponseWriter& writer, uint16_t seq) {
   response.msg_id = msg_u8(MsgId::IDENTITY);
   response.flags = static_cast<uint8_t>(PacketFlag::RESPONSE);
   response.seq = seq;
-  response.payload_len = 16;
+  response.payload_len = 64;
   response.payload[0] = PROTOCOL_VERSION;
-  response.payload[1] = 1;  // firmware major
-  response.payload[2] = 0;  // firmware minor
-  response.payload[3] = 0;  // firmware patch
+  response.payload[1] = FIRMWARE_VERSION_MAJOR;
+  response.payload[2] = FIRMWARE_VERSION_MINOR;
+  response.payload[3] = FIRMWARE_VERSION_PATCH;
   response.payload[4] = 1;  // board family: ESP32-C6 V1
   response.payload[5] = 1;  // axis count
   write_u16(response.payload + 6, CONFIG_VERSION);
   write_u32(response.payload + 8, 0x54464144u);  // DAFT
   write_u32(response.payload + 12, config_generation_);
+  response.payload[16] = BUILD_GIT_DIRTY ? 1 : 0;
+  copy_ascii(response.payload + 20, 20, BUILD_GIT_SHA, &response.payload[17]);
+  copy_ascii(response.payload + 40, 24, BUILD_DATE, &response.payload[18]);
+  response.payload[19] = 0;
   send_response(writer, response);
 }
 
@@ -704,6 +755,10 @@ void Actuator::send_driver_status(const ResponseWriter& writer, uint16_t seq) {
   if (backend_.driver_status != nullptr) {
     status = backend_.driver_status(backend_.context);
   }
+  if (status.configured != 0 && status.uart_ok == 0) {
+    set_fault(FaultFlag::DRIVER_UART, &writer);
+    send_event(writer, seq, EventType::DRIVER_UART_FAILURE, EventSeverity::ERROR, 0, status.raw_status);
+  }
 
   Packet response{};
   response.msg_id = msg_u8(MsgId::DRIVER_STATUS);
@@ -740,7 +795,22 @@ void Actuator::send_config_value(const ResponseWriter& writer, uint16_t seq, Con
   send_response(writer, response);
 }
 
-ErrorCode Actuator::stage_field(const Packet& request) {
+void Actuator::send_event(const ResponseWriter& writer, uint16_t seq, EventType event, EventSeverity severity,
+                          uint16_t detail, uint32_t value) {
+  Packet response{};
+  response.msg_id = msg_u8(MsgId::EVENT);
+  response.flags = 0;
+  response.seq = seq;
+  response.payload_len = 12;
+  response.payload[0] = static_cast<uint8_t>(event);
+  response.payload[1] = static_cast<uint8_t>(severity);
+  write_u16(response.payload + 2, detail);
+  write_u32(response.payload + 4, value);
+  write_u32(response.payload + 8, now_ms());
+  send_response(writer, response);
+}
+
+ErrorCode Actuator::stage_field(const Packet& request, const ResponseWriter* event_writer) {
   if (request.payload_len != 6) {
     return ErrorCode::ERR_BAD_PAYLOAD;
   }
@@ -752,7 +822,7 @@ ErrorCode Actuator::stage_field(const Packet& request) {
   }
 
   const ConfigMutability mutability = config_field_mutability(field);
-  if (mutability == ConfigMutability::COMPILE_TIME_ONLY) {
+  if (mutability == ConfigMutability::COMPILE_TIME_ONLY || mutability == ConfigMutability::RESERVED) {
     return ErrorCode::ERR_UNSUPPORTED;
   }
   if (mutability == ConfigMutability::REQUIRES_REBOOT) {
@@ -768,12 +838,12 @@ ErrorCode Actuator::stage_field(const Packet& request) {
   staged_config_ = candidate;
   config_staged_ = true;
   if (!is_motion_state()) {
-    state_ = ActuatorState::CONFIG_STAGED;
+    transition_to(ActuatorState::CONFIG_STAGED, event_writer);
   }
   return ErrorCode::OK;
 }
 
-ErrorCode Actuator::apply_staged_config() {
+ErrorCode Actuator::apply_staged_config(const ResponseWriter* event_writer) {
   if (!config_staged_) {
     return ErrorCode::OK;
   }
@@ -783,7 +853,7 @@ ErrorCode Actuator::apply_staged_config() {
 
   const ConfigValidationResult validation = validate_config(staged_config_);
   if (!validation.ok) {
-    set_fault(FaultFlag::INVALID_CONFIG);
+    set_fault(FaultFlag::INVALID_CONFIG, event_writer);
     return ErrorCode::ERR_OUT_OF_RANGE;
   }
 
@@ -795,13 +865,17 @@ ErrorCode Actuator::apply_staged_config() {
 
   if (driver_changed && backend_.configure_driver != nullptr &&
       !backend_.configure_driver(backend_.context, staged_config_.driver)) {
-    set_fault(FaultFlag::DRIVER);
+    set_fault(FaultFlag::DRIVER, event_writer);
     return ErrorCode::ERR_BAD_STATE;
   }
 
   active_config_ = staged_config_;
   config_staged_ = false;
-  state_ = driver_enabled_ ? ActuatorState::IDLE : ActuatorState::DISABLED;
+  transition_to(driver_enabled_ ? ActuatorState::IDLE : ActuatorState::DISABLED, event_writer);
+  if (event_writer != nullptr) {
+    send_event(*event_writer, 0, EventType::CONFIG_APPLIED, EventSeverity::INFO, CONFIG_VERSION,
+               config_generation_);
+  }
   return ErrorCode::OK;
 }
 
@@ -898,10 +972,27 @@ int32_t Actuator::logical_current_speed() const {
   return from_backend_value(backend_.current_speed != nullptr ? backend_.current_speed(backend_.context) : 0);
 }
 
-void Actuator::set_fault(FaultFlag flag) {
-  faults_ |= fault_value(flag);
+void Actuator::set_fault(FaultFlag flag, const ResponseWriter* event_writer) {
+  const uint32_t mask = fault_value(flag);
+  const bool newly_set = (faults_ & mask) == 0;
+  faults_ |= mask;
+  if (newly_set && event_writer != nullptr) {
+    send_event(*event_writer, 0, EventType::FAULT_SET, EventSeverity::ERROR, fault_bit(flag), faults_);
+  }
   if (flag != FaultFlag::HOST_TIMEOUT && flag != FaultFlag::SOFT_LIMIT) {
-    state_ = ActuatorState::FAULTED;
+    transition_to(ActuatorState::FAULTED, event_writer);
+  }
+}
+
+void Actuator::transition_to(ActuatorState state, const ResponseWriter* event_writer) {
+  if (state_ == state) {
+    return;
+  }
+  const ActuatorState previous = state_;
+  state_ = state;
+  if (event_writer != nullptr) {
+    send_event(*event_writer, 0, EventType::STATE_CHANGED, EventSeverity::INFO,
+               static_cast<uint16_t>(previous), static_cast<uint32_t>(state));
   }
 }
 

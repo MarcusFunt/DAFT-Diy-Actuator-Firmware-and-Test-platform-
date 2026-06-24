@@ -77,6 +77,23 @@ class ControlMode(IntEnum):
     COMMISSIONING = 3
 
 
+class EventType(IntEnum):
+    BOOT_REASON = 1
+    STATE_CHANGED = 2
+    FAULT_SET = 3
+    FAULT_CLEARED = 4
+    CONFIG_APPLIED = 5
+    CONFIG_SAVED = 6
+    DRIVER_UART_FAILURE = 7
+    HOST_TIMEOUT = 8
+
+
+class EventSeverity(IntEnum):
+    INFO = 0
+    WARNING = 1
+    ERROR = 2
+
+
 class ConfigField(IntEnum):
     TELEMETRY_INTERVAL_MS = 1
     SOFT_LIMITS_ENABLED = 2
@@ -106,6 +123,7 @@ class Mutability(IntEnum):
     REQUIRES_DRIVER_REINIT = 2
     REQUIRES_REBOOT = 3
     COMPILE_TIME_ONLY = 4
+    RESERVED = 5
 
 
 def _require_len(packet: Packet, length: int, name: str) -> None:
@@ -164,11 +182,12 @@ def parse_error(packet: Packet) -> dict[str, object]:
     }
 
 
-def parse_identity(packet: Packet) -> dict[str, int | str]:
-    _require_len(packet, 16, "IDENTITY")
+def parse_identity(packet: Packet) -> dict[str, int | str | bool]:
+    if len(packet.payload) not in (16, 64):
+        raise ProtocolError("IDENTITY payload must be 16 or 64 bytes")
     proto, major, minor, patch, board, axes, config_version = struct.unpack_from("<BBBBBBH", packet.payload, 0)
     magic, generation = struct.unpack_from("<II", packet.payload, 8)
-    return {
+    fields: dict[str, int | str | bool] = {
         "protocol_version": proto,
         "firmware": f"{major}.{minor}.{patch}",
         "board_family": board,
@@ -176,7 +195,18 @@ def parse_identity(packet: Packet) -> dict[str, int | str]:
         "config_version": config_version,
         "magic": f"0x{magic:08X}",
         "config_generation": generation,
+        "git_sha": "unknown",
+        "build_date": "unknown",
+        "dirty": True,
     }
+    if len(packet.payload) >= 64:
+        dirty, git_len, date_len = struct.unpack_from("<BBB", packet.payload, 16)
+        git_len = min(git_len, 20)
+        date_len = min(date_len, 24)
+        fields["dirty"] = bool(dirty)
+        fields["git_sha"] = packet.payload[20 : 20 + git_len].decode("ascii", errors="replace")
+        fields["build_date"] = packet.payload[40 : 40 + date_len].decode("ascii", errors="replace")
+    return fields
 
 
 def parse_capabilities(packet: Packet) -> dict[str, int | bool]:
@@ -252,4 +282,16 @@ def parse_driver_status(packet: Packet) -> dict[str, int | bool]:
         "run_current_ma": current,
         "microsteps": microsteps,
         "raw_status": raw_status,
+    }
+
+
+def parse_event(packet: Packet) -> dict[str, int | str]:
+    _require_len(packet, 12, "EVENT")
+    event, severity, detail, value, uptime_ms = struct.unpack("<BBHII", packet.payload)
+    return {
+        "event": EventType(event).name if event in EventType._value2member_map_ else f"EVENT_{event}",
+        "severity": EventSeverity(severity).name if severity in EventSeverity._value2member_map_ else f"SEV_{severity}",
+        "detail": detail,
+        "value": value,
+        "uptime_ms": uptime_ms,
     }

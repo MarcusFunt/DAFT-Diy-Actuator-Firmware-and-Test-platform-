@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import random
 import struct
+from pathlib import Path
 
 import pytest
 
 from daft_protocol.codec import Packet, ProtocolError, decode_packet, encode_packet
 from daft_protocol.client import DaftClient
-from daft_protocol.messages import MsgId, build_move, parse_ack, parse_error, parse_status
+from daft_protocol.messages import MsgId, build_move, parse_ack, parse_error, parse_event, parse_identity, parse_status
 from daft_protocol.transport_serial import SerialTransport
 
 
@@ -40,6 +41,26 @@ def test_round_trip_packet() -> None:
     assert packet.msg_id == MsgId.MOVE_ABS
     assert packet.seq == 42
     assert packet.payload == payload
+
+
+def test_golden_frame_fixtures() -> None:
+    fixture = Path(__file__).resolve().parents[2] / "protocol" / "golden_frames.txt"
+    for line in fixture.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, msg_hex, flags_hex, seq_text, payload_hex, frame_hex = line.split("|")
+        msg_id = int(msg_hex, 16)
+        flags = int(flags_hex, 16)
+        seq = int(seq_text)
+        payload = bytes.fromhex(payload_hex)
+        frame = bytes.fromhex(frame_hex)
+
+        assert encode_packet(msg_id, seq, payload, flags) == frame, name
+        packet = decode_packet(frame[:-1])
+        assert packet.msg_id == msg_id, name
+        assert packet.flags == flags, name
+        assert packet.seq == seq, name
+        assert packet.payload == payload, name
 
 
 def test_crc_rejects_corruption() -> None:
@@ -119,6 +140,36 @@ def test_ack_and_error_parsers_tolerate_unknown_values() -> None:
     assert err == {"rejected_msg": "0xFD", "code": "ERR_253"}
 
 
+def test_parse_extended_identity_payload() -> None:
+    payload = bytearray(64)
+    struct.pack_into("<BBBBBBHII", payload, 0, 2, 1, 0, 0, 1, 1, 1, 0x54464144, 7)
+    git_sha = b"abcdef123456"
+    build_date = b"2026-06-24T10:00Z"
+    payload[16] = 1
+    payload[17] = len(git_sha)
+    payload[18] = len(build_date)
+    payload[20 : 20 + len(git_sha)] = git_sha
+    payload[40 : 40 + len(build_date)] = build_date
+
+    fields = parse_identity(Packet(msg_id=MsgId.IDENTITY, payload=bytes(payload)))
+
+    assert fields["firmware"] == "1.0.0"
+    assert fields["git_sha"] == "abcdef123456"
+    assert fields["build_date"] == "2026-06-24T10:00Z"
+    assert fields["dirty"] is True
+
+
+def test_parse_event_payload() -> None:
+    packet = Packet(msg_id=MsgId.EVENT, payload=struct.pack("<BBHII", 2, 0, 1, 2, 1234))
+    assert parse_event(packet) == {
+        "event": "STATE_CHANGED",
+        "severity": "INFO",
+        "detail": 1,
+        "value": 2,
+        "uptime_ms": 1234,
+    }
+
+
 def test_client_uses_telemetry_flag_before_sequence_match() -> None:
     telemetry_payload = struct.pack("<BBBBIiiiIII", 2, 1, 1, 0, 0, 10, 20, 30, 1000, 3, 9)
     transport = FakeTransport(
@@ -133,3 +184,19 @@ def test_client_uses_telemetry_flag_before_sequence_match() -> None:
 
     assert ack["acked_msg"] == "HEARTBEAT"
     assert len(client.telemetry) == 1
+
+
+def test_client_collects_events_before_sequence_match() -> None:
+    event_payload = struct.pack("<BBHII", 3, 2, 9, 1 << 9, 200)
+    transport = FakeTransport(
+        [
+            Packet(msg_id=MsgId.EVENT, seq=0, payload=event_payload),
+            Packet(msg_id=MsgId.ACK, seq=1, payload=b"\x0D\x00"),
+        ]
+    )
+    client = DaftClient(transport)
+
+    ack = client.acked(MsgId.HEARTBEAT)
+
+    assert ack["acked_msg"] == "HEARTBEAT"
+    assert client.events[0]["event"] == "FAULT_SET"

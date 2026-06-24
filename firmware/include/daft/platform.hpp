@@ -35,6 +35,7 @@ struct MotionBackend {
   bool (*load_config)(void* context, ActuatorConfig* config, uint32_t* generation) = nullptr;
   bool (*reset_config_storage)(void* context) = nullptr;
   void (*reboot)(void* context) = nullptr;
+  uint32_t (*boot_reason)(void* context) = nullptr;
 };
 
 }  // namespace daft

@@ -1,9 +1,11 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "daft/actuator.hpp"
+#include "daft/config_store.hpp"
 #include "daft/config.hpp"
 #include "daft/protocol_v2.hpp"
 
@@ -27,8 +29,22 @@ struct FakeBackend {
 };
 
 struct Capture {
-  Packet packets[32]{};
+  Packet packets[64]{};
   size_t count = 0;
+};
+
+struct SimStoreSlot {
+  bool valid_marker = false;
+  uint8_t meta[CONFIG_STORE_META_SIZE]{};
+  size_t meta_len = 0;
+  uint8_t payload[CONFIG_BLOB_MAX_SIZE]{};
+  size_t payload_len = 0;
+};
+
+struct SimStore {
+  SimStoreSlot slots[CONFIG_STORE_SLOT_COUNT]{};
+  bool fail_next_write = false;
+  bool partial_next_write = false;
 };
 
 uint32_t fake_millis(void* context) {
@@ -125,7 +141,7 @@ bool fake_reset_config(void*) {
 
 bool capture_send(void* context, const Packet& packet) {
   Capture* capture = static_cast<Capture*>(context);
-  assert(capture->count < 8);
+  assert(capture->count < sizeof(capture->packets) / sizeof(capture->packets[0]));
   capture->packets[capture->count++] = packet;
   return true;
 }
@@ -159,11 +175,114 @@ ResponseWriter make_writer(Capture* capture) {
   return writer;
 }
 
+bool sim_read_slot(void* context, uint8_t slot, ConfigStoreSlotRead* out) {
+  SimStore* store = static_cast<SimStore*>(context);
+  if (slot >= CONFIG_STORE_SLOT_COUNT) {
+    return false;
+  }
+  const SimStoreSlot& source = store->slots[slot];
+  out->valid_marker = source.valid_marker;
+  out->meta_len = source.meta_len;
+  out->payload_len = source.payload_len;
+  memcpy(out->meta, source.meta, sizeof(out->meta));
+  memcpy(out->payload, source.payload, sizeof(out->payload));
+  return true;
+}
+
+bool sim_write_slot(void* context, uint8_t slot, const uint8_t* meta, size_t meta_len,
+                    const uint8_t* payload, size_t payload_len) {
+  SimStore* store = static_cast<SimStore*>(context);
+  if (slot >= CONFIG_STORE_SLOT_COUNT || store->fail_next_write) {
+    store->fail_next_write = false;
+    return false;
+  }
+
+  SimStoreSlot& target = store->slots[slot];
+  target.valid_marker = false;
+  target.payload_len = store->partial_next_write && payload_len > 0 ? payload_len - 1 : payload_len;
+  memcpy(target.payload, payload, target.payload_len);
+  target.meta_len = meta_len;
+  memcpy(target.meta, meta, meta_len);
+  target.valid_marker = true;
+  store->partial_next_write = false;
+  return true;
+}
+
+bool sim_clear_store(void* context) {
+  *static_cast<SimStore*>(context) = SimStore{};
+  return true;
+}
+
+ConfigStoreIo make_store_io(SimStore* store) {
+  ConfigStoreIo io{};
+  io.context = store;
+  io.read_slot = sim_read_slot;
+  io.write_slot = sim_write_slot;
+  io.clear = sim_clear_store;
+  return io;
+}
+
 Packet request(MsgId msg, uint16_t seq = 1) {
   Packet packet{};
   packet.msg_id = static_cast<uint8_t>(msg);
   packet.seq = seq;
   return packet;
+}
+
+void sim_put_slot(SimStore* store, uint8_t slot, const ActuatorConfig& config, uint32_t generation,
+                  bool valid_marker = true) {
+  SimStoreSlot& target = store->slots[slot];
+  memset(&target, 0, sizeof(target));
+  size_t payload_len = 0;
+  assert(serialize_config(config, target.payload, sizeof(target.payload), &payload_len));
+  target.payload_len = payload_len;
+  target.meta_len = CONFIG_STORE_META_SIZE;
+  write_u32(target.meta, CONFIG_STORE_MAGIC);
+  write_u16(target.meta + 4, CONFIG_VERSION);
+  write_u16(target.meta + 6, static_cast<uint16_t>(payload_len));
+  write_u32(target.meta + 8, generation);
+  write_u16(target.meta + 12, crc16_ccitt(target.payload, payload_len));
+  write_u16(target.meta + 14, 0);
+  target.valid_marker = valid_marker;
+}
+
+size_t split_fixture_line(char* line, char** parts, size_t capacity) {
+  size_t count = 0;
+  parts[count++] = line;
+  for (char* p = line; *p != '\0'; ++p) {
+    if (*p == '|') {
+      *p = '\0';
+      assert(count < capacity);
+      parts[count++] = p + 1;
+    }
+  }
+  return count;
+}
+
+uint8_t parse_hex_nibble(char value) {
+  if (value >= '0' && value <= '9') {
+    return static_cast<uint8_t>(value - '0');
+  }
+  if (value >= 'A' && value <= 'F') {
+    return static_cast<uint8_t>(value - 'A' + 10);
+  }
+  if (value >= 'a' && value <= 'f') {
+    return static_cast<uint8_t>(value - 'a' + 10);
+  }
+  assert(false);
+  return 0;
+}
+
+size_t parse_hex_bytes(const char* hex, uint8_t* out, size_t capacity) {
+  const size_t hex_len = strlen(hex);
+  assert(hex_len % 2 == 0);
+  const size_t byte_len = hex_len / 2;
+  assert(byte_len <= capacity);
+  for (size_t i = 0; i < byte_len; ++i) {
+    out[i] = static_cast<uint8_t>((parse_hex_nibble(hex[i * 2]) << 4) |
+                                  parse_hex_nibble(hex[i * 2 + 1]));
+  }
+  return byte_len;
 }
 
 void test_crc_cobs_packet_roundtrip() {
@@ -188,6 +307,63 @@ void test_crc_cobs_packet_roundtrip() {
 
   frame[3] ^= 0x55;
   assert(!decode_packet(frame, frame_len - 1, &decoded, &error));
+}
+
+void test_golden_frame_fixtures() {
+  FILE* input = fopen(DAFT_GOLDEN_FIXTURE_PATH, "r");
+  assert(input != nullptr);
+
+  char line[512]{};
+  size_t cases = 0;
+  while (fgets(line, sizeof(line), input) != nullptr) {
+    const size_t line_len = strlen(line);
+    if (line_len > 0 && line[line_len - 1] == '\n') {
+      line[line_len - 1] = '\0';
+    }
+    const size_t trimmed_len = strlen(line);
+    if (trimmed_len > 0 && line[trimmed_len - 1] == '\r') {
+      line[trimmed_len - 1] = '\0';
+    }
+    if (line[0] == '\0' || line[0] == '#') {
+      continue;
+    }
+
+    char* parts[6]{};
+    assert(split_fixture_line(line, parts, sizeof(parts) / sizeof(parts[0])) == 6);
+    uint8_t payload[MAX_PAYLOAD_SIZE]{};
+    const size_t payload_len = parse_hex_bytes(parts[4], payload, sizeof(payload));
+    uint8_t expected_frame[MAX_FRAME_SIZE]{};
+    const size_t expected_frame_len = parse_hex_bytes(parts[5], expected_frame, sizeof(expected_frame));
+
+    Packet packet{};
+    packet.msg_id = static_cast<uint8_t>(strtoul(parts[1], nullptr, 16));
+    packet.flags = static_cast<uint8_t>(strtoul(parts[2], nullptr, 16));
+    packet.seq = static_cast<uint16_t>(strtoul(parts[3], nullptr, 10));
+    packet.payload_len = static_cast<uint16_t>(payload_len);
+    assert(packet.payload_len <= MAX_PAYLOAD_SIZE);
+    if (payload_len > 0) {
+      memcpy(packet.payload, payload, payload_len);
+    }
+
+    uint8_t frame[MAX_FRAME_SIZE]{};
+    size_t frame_len = 0;
+    assert(encode_packet(packet, frame, sizeof(frame), &frame_len));
+    assert(frame_len == expected_frame_len);
+    assert(memcmp(frame, expected_frame, expected_frame_len) == 0);
+
+    Packet decoded{};
+    ErrorCode error = ErrorCode::OK;
+    assert(decode_packet(expected_frame, expected_frame_len - 1, &decoded, &error));
+    assert(decoded.msg_id == packet.msg_id);
+    assert(decoded.flags == packet.flags);
+    assert(decoded.seq == packet.seq);
+    assert(decoded.payload_len == packet.payload_len);
+    assert(decoded.payload_len == 0 || memcmp(decoded.payload, packet.payload, decoded.payload_len) == 0);
+    ++cases;
+  }
+  fclose(input);
+
+  assert(cases > 0);
 }
 
 void test_framing_partial_and_back_to_back() {
@@ -235,6 +411,73 @@ void test_config_validation_and_serialization() {
 
   result = stage_config_field(config, ConfigField::MICROSTEPS, 3);
   assert(!result.ok);
+
+  assert(config_field_mutability(ConfigField::ENABLE_TIMEOUT_MS) == ConfigMutability::RESERVED);
+  result = stage_config_field(config, ConfigField::ENABLE_TIMEOUT_MS, 500);
+  assert(!result.ok);
+}
+
+void test_config_store_load_rejects_invalid_marker_and_corruption() {
+  SimStore store{};
+  ConfigStoreIo io = make_store_io(&store);
+  ActuatorConfig config = default_config();
+  config.driver.run_current_ma = 700;
+
+  sim_put_slot(&store, 0, config, 1, false);
+  ActuatorConfig loaded{};
+  uint32_t generation = 0;
+  assert(!config_store_load(io, &loaded, &generation));
+
+  sim_put_slot(&store, 0, config, 1, true);
+  store.slots[0].payload[4] ^= 0x55;
+  assert(!config_store_load(io, &loaded, &generation));
+}
+
+void test_config_store_uses_newest_valid_generation_and_ignores_partial_write() {
+  SimStore store{};
+  ConfigStoreIo io = make_store_io(&store);
+
+  ActuatorConfig old_config = default_config();
+  old_config.driver.run_current_ma = 700;
+  ActuatorConfig new_config = default_config();
+  new_config.driver.run_current_ma = 900;
+
+  sim_put_slot(&store, 0, old_config, 10, true);
+  sim_put_slot(&store, 1, new_config, 11, true);
+  store.slots[1].payload_len -= 1;
+
+  ActuatorConfig loaded{};
+  uint32_t generation = 0;
+  assert(config_store_load(io, &loaded, &generation));
+  assert(generation == 10);
+  assert(loaded.driver.run_current_ma == 700);
+}
+
+void test_config_store_generation_wrap_and_save_targeting() {
+  SimStore store{};
+  ConfigStoreIo io = make_store_io(&store);
+
+  ActuatorConfig before_wrap = default_config();
+  before_wrap.driver.run_current_ma = 700;
+  ActuatorConfig after_wrap = default_config();
+  after_wrap.driver.run_current_ma = 900;
+
+  sim_put_slot(&store, 0, before_wrap, UINT32_MAX, true);
+  sim_put_slot(&store, 1, after_wrap, 0, true);
+
+  ActuatorConfig loaded{};
+  uint32_t generation = 123;
+  assert(config_store_load(io, &loaded, &generation));
+  assert(generation == 0);
+  assert(loaded.driver.run_current_ma == 900);
+
+  ActuatorConfig saved = default_config();
+  saved.driver.run_current_ma = 800;
+  assert(config_store_save(io, saved, &generation));
+  assert(generation == 1);
+  assert(config_store_load(io, &loaded, &generation));
+  assert(generation == 1);
+  assert(loaded.driver.run_current_ma == 800);
 }
 
 void test_actuator_motion_and_busy_rejection() {
@@ -453,8 +696,12 @@ void test_motion_limits_and_direction_inversion() {
 
 int main() {
   test_crc_cobs_packet_roundtrip();
+  test_golden_frame_fixtures();
   test_framing_partial_and_back_to_back();
   test_config_validation_and_serialization();
+  test_config_store_load_rejects_invalid_marker_and_corruption();
+  test_config_store_uses_newest_valid_generation_and_ignores_partial_write();
+  test_config_store_generation_wrap_and_save_targeting();
   test_actuator_motion_and_busy_rejection();
   test_velocity_timeout();
   test_duplicate_replay_and_mismatch();

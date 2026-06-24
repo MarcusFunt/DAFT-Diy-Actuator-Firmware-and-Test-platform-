@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(daft_core
   src/actuator.cpp
   src/cobs.cpp
+  src/config_store.cpp
   src/config_validation.cpp
   src/crc.cpp
   src/protocol_v2.cpp
@@ -27,6 +28,9 @@ add_executable(daft_core_tests
 )
 
 target_link_libraries(daft_core_tests PRIVATE daft_core)
+target_compile_definitions(daft_core_tests PRIVATE
+  DAFT_GOLDEN_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../protocol/golden_frames.txt"
+)
 
 enable_testing()
 add_test(NAME daft_core_tests COMMAND daft_core_tests)

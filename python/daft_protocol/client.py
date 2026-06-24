@@ -20,6 +20,7 @@ from .messages import (
     parse_counters,
     parse_driver_status,
     parse_error,
+    parse_event,
     parse_faults,
     parse_identity,
     parse_status,
@@ -40,6 +41,7 @@ class DaftClient:
     transport: object
     next_seq: int = 1
     telemetry: list[dict[str, object]] = field(default_factory=list)
+    events: list[dict[str, object]] = field(default_factory=list)
 
     def _seq(self) -> int:
         seq = self.next_seq
@@ -57,6 +59,9 @@ class DaftClient:
             packet = self.transport.read_packet()
             if packet.msg_id == int(MsgId.STATUS) and (packet.flags & TELEMETRY_FLAG):
                 self.telemetry.append(parse_status(packet))
+                continue
+            if packet.msg_id == int(MsgId.EVENT):
+                self.events.append(parse_event(packet))
                 continue
             if packet.seq != seq:
                 continue
@@ -81,6 +86,9 @@ class DaftClient:
             if packet.msg_id == int(MsgId.STATUS) and (packet.flags & TELEMETRY_FLAG):
                 self.telemetry.append(parse_status(packet))
                 continue
+            if packet.msg_id == int(MsgId.EVENT):
+                self.events.append(parse_event(packet))
+                continue
             if packet.seq != seq:
                 if packet.msg_id == int(MsgId.STATUS):
                     self.telemetry.append(parse_status(packet))
@@ -93,7 +101,7 @@ class DaftClient:
             if packet.msg_id == int(MsgId.PONG):
                 return saw_ack
 
-    def identity(self) -> dict[str, int | str]:
+    def identity(self) -> dict[str, int | str | bool]:
         return parse_identity(self.request(MsgId.GET_IDENTITY, expect=MsgId.IDENTITY))
 
     def capabilities(self) -> dict[str, int | bool]:

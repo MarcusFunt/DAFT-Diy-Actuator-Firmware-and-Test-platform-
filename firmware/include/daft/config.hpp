@@ -47,6 +47,7 @@ enum class ConfigMutability : uint8_t {
   REQUIRES_DRIVER_REINIT = 2,
   REQUIRES_REBOOT = 3,
   COMPILE_TIME_ONLY = 4,
+  RESERVED = 5,
 };
 
 struct BoardPins {
@@ -92,11 +93,13 @@ struct MotionLimits {
 
 struct TelemetryConfig {
   uint16_t interval_ms = 0;
+  // Reserved in V1. STATUS telemetry currently always uses the fixed status payload.
   uint16_t enabled_fields = 0xFFFF;
   bool binary_stream_enabled = true;
 };
 
 struct CalibrationConfig {
+  // Offset/origin fields are persisted for future commissioning semantics but reserved in V1 commands.
   int32_t position_offset_steps = 0;
   int32_t home_position_steps = 0;
   bool direction_inverted = false;
@@ -106,6 +109,7 @@ struct CalibrationConfig {
 struct SafetyConfig {
   uint32_t host_timeout_ms = 1000;
   TimeoutAction velocity_timeout_action = TimeoutAction::RAMP_STOP;
+  // Reserved in V1. Drivers are enabled/disabled explicitly by control mode commands.
   uint32_t enable_timeout_ms = 0;
   uint16_t max_allowed_current_ma = 1400;
   uint32_t max_allowed_velocity_sps = 50000;

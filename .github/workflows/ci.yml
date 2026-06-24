@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Python tests
+        run: python -m pytest -q python/tests
+
+      - name: CMake configure
+        run: cmake -S firmware -B firmware/build
+
+      - name: CMake build
+        run: cmake --build firmware/build --parallel
+
+      - name: CTest
+        run: ctest --test-dir firmware/build --output-on-failure
+
+      - name: PlatformIO build
+        run: |
+          python -m pip install platformio
+          pio run -d firmware -e esp32c6

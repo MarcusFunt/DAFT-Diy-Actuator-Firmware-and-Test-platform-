@@ -17,7 +17,7 @@ struct ResponseWriter {
 class Actuator {
  public:
   void begin(const ActuatorConfig& defaults, const MotionBackend& backend);
-  void update();
+  void update(const ResponseWriter* event_writer = nullptr);
   bool should_send_telemetry() const;
   void mark_telemetry_sent();
   void send_telemetry(const ResponseWriter& writer, uint16_t seq);
@@ -40,12 +40,15 @@ class Actuator {
   void send_counters(const ResponseWriter& writer, uint16_t seq);
   void send_driver_status(const ResponseWriter& writer, uint16_t seq);
   void send_config_value(const ResponseWriter& writer, uint16_t seq, ConfigField field);
-  ErrorCode stage_field(const Packet& request);
-  ErrorCode apply_staged_config();
+  void send_event(const ResponseWriter& writer, uint16_t seq, EventType event, EventSeverity severity,
+                  uint16_t detail, uint32_t value);
+  ErrorCode stage_field(const Packet& request, const ResponseWriter* event_writer);
+  ErrorCode apply_staged_config(const ResponseWriter* event_writer);
   ErrorCode validate_motion_allowed(ControlMode requested_mode) const;
   bool is_motion_state() const;
   uint32_t now_ms() const;
-  void set_fault(FaultFlag flag);
+  void set_fault(FaultFlag flag, const ResponseWriter* event_writer = nullptr);
+  void transition_to(ActuatorState state, const ResponseWriter* event_writer = nullptr);
   bool send_response(const ResponseWriter& writer, const Packet& packet);
   bool same_request(const Packet& request) const;
   void remember_request(const Packet& request, const Packet* responses, uint8_t response_count);
@@ -67,6 +70,8 @@ class Actuator {
   uint32_t config_generation_ = 0;
   bool driver_enabled_ = false;
   bool config_staged_ = false;
+  bool boot_event_pending_ = false;
+  uint32_t boot_reason_ = 0;
   uint32_t last_host_ms_ = 0;
   uint32_t last_telemetry_ms_ = 0;
   bool last_request_valid_ = false;

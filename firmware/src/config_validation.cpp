@@ -91,16 +91,17 @@ ConfigMutability config_field_mutability(ConfigField field) {
     case ConfigField::DEFAULT_MAX_VELOCITY_SPS:
     case ConfigField::DEFAULT_MAX_ACCEL_SPS2:
     case ConfigField::DEFAULT_STOP_DECEL_SPS2:
-    case ConfigField::POSITION_OFFSET_STEPS:
-    case ConfigField::HOME_POSITION_STEPS:
     case ConfigField::DIRECTION_INVERTED:
     case ConfigField::HOST_TIMEOUT_MS:
     case ConfigField::VELOCITY_TIMEOUT_ACTION:
-    case ConfigField::ENABLE_TIMEOUT_MS:
     case ConfigField::MAX_ALLOWED_CURRENT_MA:
     case ConfigField::MAX_ALLOWED_VELOCITY_SPS:
     case ConfigField::MAX_ALLOWED_ACCEL_SPS2:
       return ConfigMutability::RUNTIME_SAFE;
+    case ConfigField::POSITION_OFFSET_STEPS:
+    case ConfigField::HOME_POSITION_STEPS:
+    case ConfigField::ENABLE_TIMEOUT_MS:
+      return ConfigMutability::RESERVED;
     case ConfigField::RUN_CURRENT_MA:
     case ConfigField::HOLD_CURRENT_MA:
     case ConfigField::MICROSTEPS:
@@ -195,11 +196,9 @@ ConfigValidationResult stage_config_field(ActuatorConfig& staged, ConfigField fi
       staged.driver.mode = static_cast<DriverMode>(value);
       break;
     case ConfigField::POSITION_OFFSET_STEPS:
-      staged.calibration.position_offset_steps = value;
-      break;
     case ConfigField::HOME_POSITION_STEPS:
-      staged.calibration.home_position_steps = value;
-      break;
+    case ConfigField::ENABLE_TIMEOUT_MS:
+      return fail(field, "reserved in V1");
     case ConfigField::DIRECTION_INVERTED:
       staged.calibration.direction_inverted = value != 0;
       break;
@@ -210,10 +209,6 @@ ConfigValidationResult stage_config_field(ActuatorConfig& staged, ConfigField fi
     case ConfigField::VELOCITY_TIMEOUT_ACTION:
       if (value < 0 || value > 1) return fail(field, "timeout action out of range");
       staged.safety.velocity_timeout_action = static_cast<TimeoutAction>(value);
-      break;
-    case ConfigField::ENABLE_TIMEOUT_MS:
-      if (value < 0) return fail(field, "enable timeout out of range");
-      staged.safety.enable_timeout_ms = static_cast<uint32_t>(value);
       break;
     case ConfigField::MAX_ALLOWED_CURRENT_MA:
       if (value <= 0 || value > 65535) return fail(field, "max current out of range");
