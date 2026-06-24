@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef DISABLED
+#undef DISABLED
+#endif
+
 #include "daft/actuator.hpp"
 #include "daft/config.hpp"
 #include "daft/protocol_v2.hpp"
@@ -92,11 +96,16 @@ bool read_slot(uint8_t slot, ActuatorConfig* config, uint32_t* generation) {
   }
 
   const bool valid = prefs.getUInt(valid_key, 0) == SLOT_VALID_MARKER;
+  if (!valid) {
+    prefs.end();
+    return false;
+  }
+
   uint8_t meta_raw[16]{};
   uint8_t payload[CONFIG_BLOB_MAX_SIZE]{};
   const size_t meta_len = prefs.getBytes(meta_key, meta_raw, sizeof(meta_raw));
   SlotMeta meta{};
-  bool ok = valid && meta_len == sizeof(meta_raw) && read_meta(meta_raw, &meta);
+  bool ok = meta_len == sizeof(meta_raw) && read_meta(meta_raw, &meta);
   if (ok) {
     const size_t payload_len = prefs.getBytes(payload_key, payload, sizeof(payload));
     ok = payload_len == meta.length && crc16_ccitt(payload, meta.length) == meta.crc &&

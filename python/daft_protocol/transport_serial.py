@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import serial
@@ -19,7 +20,10 @@ def list_serial_ports() -> list[str]:
 class SerialTransport:
     port_name: str
     baud_rate: int = DEFAULT_BAUD
-    timeout: float = 0.2
+    timeout: float = 0.05
+    write_timeout: float = 0.2
+    open_delay: float = 0.6
+    packet_timeout: float = 2.0
 
     def __post_init__(self) -> None:
         self._port: serial.Serial | None = None
@@ -42,10 +46,14 @@ class SerialTransport:
             self.port_name,
             self.baud_rate,
             timeout=self.timeout,
-            write_timeout=self.timeout,
+            write_timeout=self.write_timeout,
             inter_byte_timeout=0.02,
         )
         self._rx.clear()
+        if self.open_delay > 0:
+            time.sleep(self.open_delay)
+        self._port.reset_input_buffer()
+        self._port.reset_output_buffer()
 
     def close(self) -> None:
         if self._port is not None:
@@ -57,30 +65,38 @@ class SerialTransport:
             raise RuntimeError("serial port is not open")
         self._port.write(encode_packet(msg_id, seq, payload, flags))
 
-    def read_packet(self, timeout_packets: int = 256) -> Packet:
+    def _read_buffered_packet(self) -> Packet | None:
+        while True:
+            try:
+                delimiter = self._rx.index(0)
+            except ValueError:
+                if len(self._rx) > 256:
+                    self._rx.clear()
+                    raise ProtocolError("RX buffer overflow")
+                return None
+
+            frame = bytes(self._rx[:delimiter])
+            del self._rx[: delimiter + 1]
+            if not frame:
+                continue
+            return decode_packet(frame)
+
+    def read_packet(self, timeout: float | None = None) -> Packet:
         if self._port is None:
             raise RuntimeError("serial port is not open")
 
-        empty_reads = 0
-        while empty_reads < timeout_packets:
+        deadline = time.monotonic() + (self.packet_timeout if timeout is None else timeout)
+        while time.monotonic() < deadline:
+            try:
+                packet = self._read_buffered_packet()
+            except ProtocolError:
+                continue
+            if packet is not None:
+                return packet
+
             chunk = self._port.read(128)
             if not chunk:
-                empty_reads += 1
                 continue
             self._rx.extend(chunk)
-            while True:
-                try:
-                    delimiter = self._rx.index(0)
-                except ValueError:
-                    if len(self._rx) > 256:
-                        self._rx.clear()
-                        raise ProtocolError("RX buffer overflow")
-                    break
-
-                frame = bytes(self._rx[:delimiter])
-                del self._rx[: delimiter + 1]
-                if not frame:
-                    continue
-                return decode_packet(frame)
 
         raise TimeoutError("timed out waiting for packet")
