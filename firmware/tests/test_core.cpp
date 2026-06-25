@@ -24,7 +24,9 @@ struct FakeBackend {
   uint32_t move_rel_count = 0;
   uint32_t run_vel_count = 0;
   uint32_t stop_count = 0;
+  uint32_t configure_count = 0;
   uint32_t save_count = 0;
+  bool configure_ok = true;
   ActuatorConfig saved{};
 };
 
@@ -56,8 +58,10 @@ bool fake_enable(void* context, bool enabled) {
   return true;
 }
 
-bool fake_configure(void*, const Tmc2209Config&) {
-  return true;
+bool fake_configure(void* context, const Tmc2209Config&) {
+  FakeBackend* backend = static_cast<FakeBackend*>(context);
+  backend->configure_count++;
+  return backend->configure_ok;
 }
 
 bool fake_move_abs(void* context, int32_t target, uint32_t, uint32_t) {
@@ -511,6 +515,48 @@ void test_actuator_motion_and_busy_rejection() {
   assert(capture.packets[capture.count - 1].payload[1] == static_cast<uint8_t>(ErrorCode::ERR_BUSY));
 }
 
+void test_driver_reconfigure_required_before_enable_after_fault() {
+  FakeBackend fake{};
+  fake.configure_ok = false;
+  Actuator actuator;
+  actuator.begin(default_config(), make_backend(&fake));
+  assert(actuator.state() == ActuatorState::FAULTED);
+  assert(has_fault(actuator.faults(), FaultFlag::DRIVER));
+  assert(fake.configure_count == 1);
+
+  Capture capture{};
+  ResponseWriter writer = make_writer(&capture);
+
+  Packet clear = request(MsgId::CLEAR_FAULTS, 70);
+  actuator.handle_packet(clear, writer);
+  assert(actuator.state() == ActuatorState::DISABLED);
+  assert(actuator.faults() == 0);
+
+  Packet mode = request(MsgId::SET_CONTROL_MODE, 71);
+  mode.payload_len = 1;
+  mode.payload[0] = static_cast<uint8_t>(ControlMode::POSITION);
+  actuator.handle_packet(mode, writer);
+  assert(!fake.enabled);
+  assert(fake.configure_count == 2);
+  assert(actuator.state() == ActuatorState::FAULTED);
+  assert(has_fault(actuator.faults(), FaultFlag::DRIVER));
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ERROR));
+  assert(capture.packets[capture.count - 1].payload[1] == static_cast<uint8_t>(ErrorCode::ERR_BAD_STATE));
+
+  fake.configure_ok = true;
+  Packet clear_again = request(MsgId::CLEAR_FAULTS, 72);
+  actuator.handle_packet(clear_again, writer);
+  Packet mode_again = request(MsgId::SET_CONTROL_MODE, 73);
+  mode_again.payload_len = 1;
+  mode_again.payload[0] = static_cast<uint8_t>(ControlMode::POSITION);
+  actuator.handle_packet(mode_again, writer);
+  assert(fake.enabled);
+  assert(fake.configure_count == 3);
+  assert(actuator.state() == ActuatorState::IDLE);
+  assert(actuator.faults() == 0);
+  assert(capture.packets[capture.count - 1].msg_id == static_cast<uint8_t>(MsgId::ACK));
+}
+
 void test_velocity_timeout() {
   FakeBackend fake{};
   ActuatorConfig config = default_config();
@@ -703,6 +749,7 @@ int main() {
   test_config_store_uses_newest_valid_generation_and_ignores_partial_write();
   test_config_store_generation_wrap_and_save_targeting();
   test_actuator_motion_and_busy_rejection();
+  test_driver_reconfigure_required_before_enable_after_fault();
   test_velocity_timeout();
   test_duplicate_replay_and_mismatch();
   test_invalid_payloads_and_control_mode();

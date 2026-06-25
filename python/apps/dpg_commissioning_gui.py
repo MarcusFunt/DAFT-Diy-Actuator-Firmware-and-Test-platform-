@@ -191,6 +191,7 @@ class App:
                 heading = dpg.add_text("Safety", color=(201, 211, 223))
                 self._bind_font(heading, "section_font")
                 with dpg.group(horizontal=True):
+                    self._connected_button(label="Clear Faults", width=120, callback=lambda: self.worker.call("clear_faults"))
                     self._connected_button(label="Ramp Stop", width=120, callback=lambda: self.worker.call("ramp_stop", 1500))
                     self._connected_button(label="E-STOP", width=120, callback=lambda: self.worker.call("estop"), theme="danger_button_theme")
 

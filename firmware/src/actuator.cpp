@@ -318,6 +318,12 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         driver_enabled_ = false;
         transition_to(ActuatorState::DISABLED, &downstream_writer);
       } else if (control_mode_ == ControlMode::COMMISSIONING) {
+        if (backend_.configure_driver != nullptr &&
+            !backend_.configure_driver(backend_.context, active_config_.driver)) {
+          set_fault(FaultFlag::DRIVER, &downstream_writer);
+          send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
+          return;
+        }
         if (backend_.enable_driver != nullptr && !backend_.enable_driver(backend_.context, true)) {
           set_fault(FaultFlag::DRIVER, &downstream_writer);
           send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
@@ -326,6 +332,12 @@ void Actuator::handle_packet(const Packet& request, const ResponseWriter& downst
         driver_enabled_ = true;
         transition_to(ActuatorState::COMMISSIONING, &downstream_writer);
       } else {
+        if (backend_.configure_driver != nullptr &&
+            !backend_.configure_driver(backend_.context, active_config_.driver)) {
+          set_fault(FaultFlag::DRIVER, &downstream_writer);
+          send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
+          return;
+        }
         if (backend_.enable_driver != nullptr && !backend_.enable_driver(backend_.context, true)) {
           set_fault(FaultFlag::DRIVER, &downstream_writer);
           send_error(writer, request.seq, msg, ErrorCode::ERR_BAD_STATE);
